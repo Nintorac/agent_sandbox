@@ -1,0 +1,36 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Go
+vendor/*/vendor/
+
+# Rust
+vendor/*/target/
+
+# Node
+vendor/*/node_modules/
+
+# Python
+vendor/*/__pycache__/
+vendor/*/*.egg-info/
+vendor/*/.eggs/
+vendor/*/dist/
+vendor/*/build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Container builds
+*.tar
+*.tar.gz

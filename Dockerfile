@@ -137,7 +137,42 @@ RUN npm install -g @anthropic-ai/claude-code \
     && npm install -g @google/gemini-cli
 
 # =============================================================================
-# Stage 6: Shell Configuration
+# Stage 6: Build & Install Flywheel Tools from vendor/
+# =============================================================================
+
+# Copy vendor directory
+USER root
+COPY --chown=agent:agent vendor /opt/vendor
+USER agent
+
+# Build Go tools (ntm, beads_viewer, gastown, caam, slb)
+RUN cd /opt/vendor/ntm && go build -o /home/agent/.local/bin/ntm . \
+    && cd /opt/vendor/beads_viewer && go build -o /home/agent/.local/bin/bv ./cmd/bv \
+    && cd /opt/vendor/gastown && go build -o /home/agent/.local/bin/gt ./cmd/gt \
+    && cd /opt/vendor/coding_agent_account_manager && go build -o /home/agent/.local/bin/caam . \
+    && cd /opt/vendor/simultaneous_launch_button && go build -o /home/agent/.local/bin/slb .
+
+# Build Rust tool (coding_agent_session_search / cass)
+RUN cd /opt/vendor/coding_agent_session_search \
+    && . "$HOME/.cargo/env" \
+    && cargo build --release \
+    && cp target/release/cass /home/agent/.local/bin/cass
+
+# Install Python tools (ultimate_bug_scanner, mcp_agent_mail)
+RUN pip install --user /opt/vendor/ultimate_bug_scanner \
+    && pip install --user /opt/vendor/mcp_agent_mail
+
+# Install Node.js tool (cass_memory_system)
+RUN cd /opt/vendor/cass_memory_system && npm install && npm link
+
+# Cleanup build artifacts to reduce image size
+RUN rm -rf /opt/vendor/*/target \
+    && rm -rf /opt/vendor/*/.git \
+    && rm -rf /home/agent/.cargo/registry \
+    && rm -rf /home/agent/.cargo/git
+
+# =============================================================================
+# Stage 7: Shell Configuration
 # =============================================================================
 
 # Install oh-my-zsh
@@ -202,7 +237,7 @@ error_symbol = "[>](bold red)"
 EOF
 
 # =============================================================================
-# Stage 7: Create workspace directories
+# Stage 8: Create workspace directories
 # =============================================================================
 
 USER root
@@ -217,7 +252,7 @@ VOLUME /home/agent/.local/share/containers
 VOLUME /workspace
 
 # =============================================================================
-# Stage 8: Entrypoint
+# Stage 9: Entrypoint
 # =============================================================================
 
 COPY --chown=agent:agent entrypoint.sh /home/agent/entrypoint.sh
