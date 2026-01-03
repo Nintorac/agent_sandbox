@@ -114,8 +114,7 @@ fi
 
 # Build volume mount arguments
 VOLUME_ARGS=(
-    # Container storage volumes (avoid overlay-on-overlay)
-    "-v" "agent-containers:/var/lib/containers"
+    # Rootless podman storage (avoid overlay-on-overlay)
     "-v" "agent-home:/home/agent/.local/share/containers"
     # Persistent workspace
     "-v" "${WORKSPACE_VOLUME}:/workspace"

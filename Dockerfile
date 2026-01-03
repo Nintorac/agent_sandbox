@@ -4,6 +4,9 @@
 
 FROM fedora:41
 
+# Build arguments
+ARG OHMYZSH_COMMIT=a79b37b95461ea2be32578957473375954ab31ff
+
 LABEL maintainer="agent-dev"
 LABEL description="AI Agent Development Environment with podman-in-podman support"
 
@@ -175,8 +178,9 @@ RUN rm -rf /opt/vendor/*/target \
 # Stage 7: Shell Configuration
 # =============================================================================
 
-# Install oh-my-zsh
-RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+# Install oh-my-zsh at pinned commit
+ARG OHMYZSH_COMMIT
+RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/${OHMYZSH_COMMIT}/tools/install.sh)" "" --unattended
 
 # Configure zsh with plugins and starship
 RUN cat > ~/.zshrc << 'EOF'
@@ -247,7 +251,7 @@ RUN mkdir -p /source /workspace \
     && chown agent:agent /source /workspace
 
 # Volumes for container storage (avoid overlay-on-overlay)
-VOLUME /var/lib/containers
+# Rootless podman storage (we don't use rootful podman)
 VOLUME /home/agent/.local/share/containers
 VOLUME /workspace
 

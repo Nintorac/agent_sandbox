@@ -271,9 +271,10 @@ See [AGENTS.md](./AGENTS.md) for detailed subtree management instructions.
 
 | Volume | Mount Point | Purpose |
 |--------|-------------|---------|
-| `agent-containers` | `/var/lib/containers` | Podman storage (rootful) |
-| `agent-home` | `/home/agent/.local/share/containers` | Podman storage (rootless) |
+| `agent-home` | `/home/agent/.local/share/containers` | Rootless podman storage |
 | `agent-workspace` | `/workspace` | Persistent workspace |
+
+> **Note:** We use rootless podman exclusively. No rootful podman configuration is included.
 
 ### Files
 
