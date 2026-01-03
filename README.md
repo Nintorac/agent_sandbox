@@ -184,6 +184,52 @@ podman build -t myapp .
     └── backend/                  # Cloned from /source/backend
 ```
 
+## Vendored Flywheel Tools
+
+We maintain the [agent-flywheel](https://agent-flywheel.com) ecosystem tools as **git subtrees** in `vendor/`. This approach lets us:
+
+- **Move fast**: No waiting for upstream releases
+- **Make changes**: Modify tools to fit our workflow
+- **Control versions**: Pin exactly what's deployed
+- **Contribute back**: Send improvements upstream when appropriate
+
+### Included Tools
+
+| Tool | Binary | Version | Purpose |
+|------|--------|---------|---------|
+| [NTM](https://github.com/Dicklesworthstone/ntm) | `ntm` | v1.3.0 | Tmux session manager for spawning/coordinating agents |
+| [Gastown](https://github.com/steveyegge/gastown) | `gt` | main | Multi-agent orchestrator with convoys and beads |
+| [Beads Viewer](https://github.com/Dicklesworthstone/beads_viewer) | `bv` | v0.11.3 | TUI for viewing/managing task beads |
+| [CASS](https://github.com/Dicklesworthstone/coding_agent_session_search) | `cass` | v0.1.49 | Search across agent session history |
+| [CASS Memory](https://github.com/Dicklesworthstone/cass_memory_system) | `cm` | v0.2.1 | Procedural memory system for agents |
+| [Agent Mail](https://github.com/Dicklesworthstone/mcp_agent_mail) | (MCP) | v0.1.3 | Agent-to-agent coordination via mailboxes |
+| [UBS](https://github.com/Dicklesworthstone/ultimate_bug_scanner) | `ubs` | v5.0.3 | Static analysis across 7 languages |
+| [CAAM](https://github.com/Dicklesworthstone/coding_agent_account_manager) | `caam` | v0.1.0 | Switch between agent auth credentials |
+| [SLB](https://github.com/Dicklesworthstone/simultaneous_launch_button) | `slb` | v0.1.0 | Two-person rule for dangerous commands |
+
+### Updating a Subtree
+
+```bash
+# Pull a new release
+git subtree pull --prefix=vendor/ntm \
+    https://github.com/Dicklesworthstone/ntm.git v1.4.0 --squash
+
+# Rebuild container
+./run.sh --build
+```
+
+### Making Local Changes
+
+Edit files in `vendor/` directly and commit:
+
+```bash
+vim vendor/ntm/cmd/spawn.go
+git add vendor/ntm/cmd/spawn.go
+git commit -m "fix(ntm): handle edge case in spawn"
+```
+
+See [AGENTS.md](./AGENTS.md) for detailed subtree management instructions.
+
 ## Container Architecture
 
 ```
