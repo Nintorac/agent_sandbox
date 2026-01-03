@@ -1,0 +1,244 @@
+//! Command palette state and rendering (keyboard-first, fuzzy-ish search).
+//! Integration hooks live in `src/ui/tui.rs`; this module stays side-effect free.
+
+use ratatui::{
+    Frame,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
+};
+
+use crate::ui::components::theme::ThemePalette;
+
+/// Action identifiers the palette can emit. These map to app-level commands.
+#[derive(Clone, Debug)]
+pub enum PaletteAction {
+    ToggleTheme,
+    ToggleDensity,
+    ToggleHelpStrip,
+    OpenUpdateBanner,
+    FilterAgent,
+    FilterWorkspace,
+    FilterToday,
+    FilterWeek,
+    FilterCustomDate,
+    OpenSavedViews,
+    SaveViewSlot(u8),
+    LoadViewSlot(u8),
+    OpenBulkActions,
+    ReloadIndex,
+}
+
+/// Render-ready descriptor for an action.
+#[derive(Clone, Debug)]
+pub struct PaletteItem {
+    pub action: PaletteAction,
+    pub label: String,
+    pub hint: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PaletteState {
+    pub open: bool,
+    pub query: String,
+    pub filtered: Vec<PaletteItem>,
+    pub all_actions: Vec<PaletteItem>,
+    pub selected: usize,
+}
+
+impl PaletteState {
+    pub fn new(actions: Vec<PaletteItem>) -> Self {
+        let filtered = actions.clone();
+        Self {
+            open: false,
+            query: String::new(),
+            filtered,
+            all_actions: actions,
+            selected: 0,
+        }
+    }
+
+    /// Recompute filtered list using simple case-insensitive substring matching.
+    pub fn refilter(&mut self) {
+        if self.query.trim().is_empty() {
+            self.filtered = self.all_actions.clone();
+        } else {
+            let q = self.query.to_lowercase();
+            self.filtered = self
+                .all_actions
+                .iter()
+                .filter(|a| {
+                    a.label.to_lowercase().contains(&q) || a.hint.to_lowercase().contains(&q)
+                })
+                .cloned()
+                .collect();
+        }
+        if self.selected >= self.filtered.len() {
+            self.selected = self.filtered.len().saturating_sub(1);
+        }
+    }
+
+    pub fn move_selection(&mut self, delta: isize) {
+        if self.filtered.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let len = self.filtered.len() as isize;
+        let idx = (self.selected as isize + delta).rem_euclid(len);
+        self.selected = idx as usize;
+    }
+}
+
+/// Render the palette overlay (clears area and draws input + filtered list).
+pub fn draw_palette(f: &mut Frame<'_>, area: Rect, state: &PaletteState, palette: ThemePalette) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // input
+            Constraint::Min(5),    // list
+        ])
+        .split(area);
+
+    let input = Paragraph::new(state.query.as_str())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title("Command Palette")
+                .style(Style::default().fg(palette.accent)),
+        )
+        .style(Style::default().fg(palette.fg))
+        .alignment(Alignment::Left);
+
+    let items: Vec<ListItem> = state
+        .filtered
+        .iter()
+        .map(|item| {
+            let label = Span::styled(&item.label, Style::default().fg(palette.fg));
+            let hint = Span::styled(
+                &item.hint,
+                Style::default()
+                    .fg(palette.hint)
+                    .add_modifier(Modifier::ITALIC),
+            );
+            ListItem::new(Line::from(vec![label, Span::raw("  "), hint]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .style(Style::default().fg(palette.fg).bg(palette.surface)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("➜ ");
+
+    // Clear and draw.
+    f.render_widget(Clear, area);
+    f.render_widget(input, chunks[0]);
+    f.render_stateful_widget(list, chunks[1], &mut list_state(state.selected));
+}
+
+fn list_state(selected: usize) -> ratatui::widgets::ListState {
+    let mut s = ratatui::widgets::ListState::default();
+    if selected != usize::MAX {
+        s.select(Some(selected));
+    }
+    s
+}
+
+/// Prebuilt action catalog to wire in tui.rs.
+pub fn default_actions() -> Vec<PaletteItem> {
+    let mut items = vec![
+        item(
+            PaletteAction::ToggleTheme,
+            "Toggle theme",
+            "Switch light/dark",
+        ),
+        item(
+            PaletteAction::ToggleDensity,
+            "Toggle density",
+            "Compact/Cozy/Spacious",
+        ),
+        item(
+            PaletteAction::ToggleHelpStrip,
+            "Toggle help strip",
+            "Pin/unpin contextual help",
+        ),
+        item(
+            PaletteAction::OpenUpdateBanner,
+            "Check updates",
+            "Show update assistant",
+        ),
+        item(
+            PaletteAction::FilterAgent,
+            "Filter: agent",
+            "Set agent filter",
+        ),
+        item(
+            PaletteAction::FilterWorkspace,
+            "Filter: workspace",
+            "Set workspace filter",
+        ),
+        item(
+            PaletteAction::FilterToday,
+            "Filter: today",
+            "Restrict to today",
+        ),
+        item(
+            PaletteAction::FilterWeek,
+            "Filter: last 7 days",
+            "Restrict to week",
+        ),
+        item(
+            PaletteAction::FilterCustomDate,
+            "Filter: date range",
+            "Prompt for since/until",
+        ),
+        item(
+            PaletteAction::OpenBulkActions,
+            "Bulk actions",
+            "Open bulk menu on selection",
+        ),
+        item(
+            PaletteAction::ReloadIndex,
+            "Reload index/view",
+            "Refresh reader",
+        ),
+        item(
+            PaletteAction::OpenSavedViews,
+            "Saved views",
+            "List saved slots",
+        ),
+    ];
+    // Slots 1-9
+    for slot in 1..=9 {
+        items.push(item(
+            PaletteAction::SaveViewSlot(slot),
+            format!("Save view to slot {slot}"),
+            "Ctrl+<n>",
+        ));
+        items.push(item(
+            PaletteAction::LoadViewSlot(slot),
+            format!("Load view from slot {slot}"),
+            "Shift+<n>",
+        ));
+    }
+    items
+}
+
+fn item(action: PaletteAction, label: impl Into<String>, hint: impl Into<String>) -> PaletteItem {
+    PaletteItem {
+        action,
+        label: label.into(),
+        hint: hint.into(),
+    }
+}
