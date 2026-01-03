@@ -1,0 +1,39 @@
+# Test files
+test/
+*.test.js
+*.test.txt
+
+# Backup files
+*.backup
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+.bv/
+
+# Python environments
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Rust build artifacts
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# Test artifacts
+test-suite/artifacts/
