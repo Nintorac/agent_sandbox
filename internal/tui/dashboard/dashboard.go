@@ -1,0 +1,3259 @@
+// Package dashboard provides a stunning visual session dashboard
+package dashboard
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/bubbles/key"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/reflow/wordwrap"
+
+	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/alerts"
+	"github.com/Dicklesworthstone/ntm/internal/bv"
+	"github.com/Dicklesworthstone/ntm/internal/cass"
+	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/history"
+	"github.com/Dicklesworthstone/ntm/internal/scanner"
+	"github.com/Dicklesworthstone/ntm/internal/status"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/tokens"
+	"github.com/Dicklesworthstone/ntm/internal/tracker"
+	"github.com/Dicklesworthstone/ntm/internal/tui/components"
+	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard/panels"
+	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
+	"github.com/Dicklesworthstone/ntm/internal/tui/layout"
+	"github.com/Dicklesworthstone/ntm/internal/tui/styles"
+	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
+)
+
+// DashboardTickMsg is sent for animation updates
+type DashboardTickMsg time.Time
+
+// RefreshMsg triggers a refresh of session data
+type RefreshMsg struct{}
+
+// StatusUpdateMsg is sent when status detection completes
+type StatusUpdateMsg struct {
+	Statuses []status.AgentStatus
+	Time     time.Time
+	Duration time.Duration
+	Err      error
+}
+
+// ConfigReloadMsg is sent when configuration changes
+type ConfigReloadMsg struct {
+	Config *config.Config
+}
+
+// HealthCheckMsg is sent when health check (bv drift) completes
+type HealthCheckMsg struct {
+	Status  string // "ok", "warning", "critical", "no_baseline", "unavailable"
+	Message string
+}
+
+// ScanStatusMsg is sent when UBS scan completes
+type ScanStatusMsg struct {
+	Status   string
+	Totals   scanner.ScanTotals
+	Duration time.Duration
+	Err      error
+}
+
+// AgentMailUpdateMsg is sent when Agent Mail data is fetched
+type AgentMailUpdateMsg struct {
+	Available bool
+	Connected bool
+	Locks     int
+	LockInfo  []AgentMailLockInfo
+}
+
+// CassSelectMsg is sent when a CASS search result is selected
+type CassSelectMsg struct {
+	Hit cass.SearchHit
+}
+
+// BeadsUpdateMsg is sent when beads data is fetched
+type BeadsUpdateMsg struct {
+	Summary bv.BeadsSummary
+	Ready   []bv.BeadPreview
+	Err     error
+}
+
+// AlertsUpdateMsg is sent when alerts are refreshed
+type AlertsUpdateMsg struct {
+	Alerts []alerts.Alert
+	Err    error
+}
+
+// MetricsUpdateMsg is sent when session metrics are updated
+type MetricsUpdateMsg struct {
+	Data panels.MetricsData
+	Err  error
+}
+
+// HistoryUpdateMsg is sent when command history is fetched
+type HistoryUpdateMsg struct {
+	Entries []history.HistoryEntry
+	Err     error
+}
+
+// FileChangeMsg is sent when file changes are detected
+type FileChangeMsg struct {
+	Changes []tracker.RecordedFileChange
+	Err     error
+}
+
+// CASSContextMsg is sent when relevant context is found
+type CASSContextMsg struct {
+	Hits []cass.SearchHit
+	Err  error
+}
+
+// PanelID identifies a dashboard panel
+type PanelID int
+
+const (
+	PanelPaneList PanelID = iota
+	PanelDetail
+	PanelBeads
+	PanelAlerts
+	PanelMetrics
+	PanelHistory
+	PanelSidebar
+	PanelCount // Total number of focusable panels
+)
+
+// Model is the session dashboard model
+type Model struct {
+	session      string
+	projectDir   string
+	panes        []tmux.Pane
+	width        int
+	height       int
+	animTick     int
+	cursor       int
+	focusedPanel PanelID
+	quitting     bool
+	err          error
+
+	// Diagnostics (opt-in)
+	showDiagnostics     bool
+	sessionFetchLatency time.Duration
+	statusFetchLatency  time.Duration
+	statusFetchErr      error
+
+	// Stats
+	claudeCount int
+	codexCount  int
+	geminiCount int
+	userCount   int
+
+	// Theme
+	theme theme.Theme
+	icons icons.IconSet
+
+	// Compaction detection and recovery
+	compaction *status.CompactionRecoveryIntegration
+
+	// Per-pane status tracking
+	paneStatus map[int]PaneStatus
+
+	// Live status detection
+	detector      *status.UnifiedDetector
+	agentStatuses map[string]status.AgentStatus // keyed by pane ID
+	lastRefresh   time.Time
+	refreshPaused bool
+	refreshCount  int
+
+	// Subsystem refresh timers
+	lastPaneFetch        time.Time
+	lastContextFetch     time.Time
+	lastAlertsFetch      time.Time
+	lastBeadsFetch       time.Time
+	lastCassContextFetch time.Time
+	lastScanFetch        time.Time
+
+	// Fetch state tracking to prevent pile-up
+	fetchingSession     bool
+	fetchingContext     bool
+	fetchingAlerts      bool
+	fetchingBeads       bool
+	fetchingCassContext bool
+	fetchingMetrics     bool
+	fetchingHistory     bool
+	fetchingFileChanges bool
+	fetchingScan        bool
+	scanDisabled        bool // User toggled UBS scanning off
+
+	// Coalescing/cancellation for user-triggered refreshes
+	sessionFetchPending bool
+	sessionFetchCancel  context.CancelFunc
+	contextFetchPending bool
+	scanFetchPending    bool
+	scanFetchCancel     context.CancelFunc
+
+	// Auto-refresh configuration
+	refreshInterval time.Duration
+
+	// Refresh cadence (configurable; defaults match the constants below)
+	paneRefreshInterval        time.Duration
+	contextRefreshInterval     time.Duration
+	alertsRefreshInterval      time.Duration
+	beadsRefreshInterval       time.Duration
+	cassContextRefreshInterval time.Duration
+	scanRefreshInterval        time.Duration
+
+	// Pane output capture budgeting/caching
+	paneOutputLines         int
+	paneOutputCaptureBudget int
+	paneOutputCaptureCursor int
+	paneOutputCache         map[string]string
+	paneOutputLastCaptured  map[string]time.Time
+	renderedOutputCache     map[string]string // Cache for expensive markdown rendering
+
+	// Health badge (bv drift status)
+	healthStatus  string // "ok", "warning", "critical", "no_baseline", "unavailable"
+	healthMessage string
+
+	// UBS scan status
+	scanStatus   string             // "clean", "warning", "critical", "unavailable"
+	scanTotals   scanner.ScanTotals // Scan result totals
+	scanDuration time.Duration      // How long the scan took
+
+	// Layout tier (narrow/split/wide/ultra)
+	tier layout.Tier
+
+	// Agent Mail integration
+	agentMailAvailable bool
+	agentMailConnected bool
+	agentMailLocks     int                 // Active file reservations
+	agentMailUnread    int                 // Unread message count (requires agent context)
+	agentMailLockInfo  []AgentMailLockInfo // Lock details for display
+
+	// Config watcher
+	configSub    chan *config.Config
+	configCloser func()
+	cfg          *config.Config
+
+	// Markdown renderer
+	renderer *glamour.TermRenderer
+
+	// CASS Search
+	showCassSearch bool
+	cassSearch     components.CassSearchModel
+
+	// Help overlay
+	showHelp bool
+
+	// Panels
+	beadsPanel   *panels.BeadsPanel
+	alertsPanel  *panels.AlertsPanel
+	metricsPanel *panels.MetricsPanel
+	historyPanel *panels.HistoryPanel
+	cassPanel    *panels.CASSPanel
+	filesPanel   *panels.FilesPanel
+	tickerPanel  *panels.TickerPanel
+
+	// Data for new panels
+	beadsSummary  bv.BeadsSummary
+	beadsReady    []bv.BeadPreview
+	activeAlerts  []alerts.Alert
+	metricsTokens int
+	metricsCost   float64
+	metricsData   panels.MetricsData // Cached full metrics data for panel
+	cmdHistory    []history.HistoryEntry
+	fileChanges   []tracker.RecordedFileChange
+	cassContext   []cass.SearchHit
+
+	// Error tracking for data sources (displayed as badges)
+	beadsError       error
+	alertsError      error
+	metricsError     error
+	historyError     error
+	fileChangesError error
+	cassError        error
+}
+
+// PaneStatus tracks the status of a pane including compaction state
+type PaneStatus struct {
+	LastCompaction *time.Time // When compaction was last detected
+	RecoverySent   bool       // Whether recovery prompt was sent
+	State          string     // "working", "idle", "error", "compacted"
+
+	// Context usage tracking
+	ContextTokens  int     // Estimated tokens used
+	ContextLimit   int     // Context limit for the model
+	ContextPercent float64 // Usage percentage (0-100+)
+	ContextModel   string  // Model name for context limit lookup
+
+	TokenVelocity float64 // Estimated tokens/sec
+}
+
+// AgentMailLockInfo represents a file lock for dashboard display
+type AgentMailLockInfo struct {
+	PathPattern string
+	AgentName   string
+	Exclusive   bool
+	ExpiresIn   string
+}
+
+// KeyMap defines dashboard keybindings
+type KeyMap struct {
+	Up             key.Binding
+	Down           key.Binding
+	Left           key.Binding
+	Right          key.Binding
+	Zoom           key.Binding
+	NextPanel      key.Binding // Tab to cycle panels
+	PrevPanel      key.Binding // Shift+Tab to cycle back
+	Send           key.Binding
+	Refresh        key.Binding
+	Pause          key.Binding
+	Quit           key.Binding
+	ContextRefresh key.Binding // 'c' to refresh context data
+	MailRefresh    key.Binding // 'm' to refresh Agent Mail data
+	CassSearch     key.Binding // 'ctrl+s' to open CASS search
+	Help           key.Binding // '?' to toggle help overlay
+	Diagnostics    key.Binding // 'd' to toggle diagnostics
+	ScanToggle     key.Binding // 'u' to toggle UBS scanning
+	Tab            key.Binding
+	ShiftTab       key.Binding
+	Num1           key.Binding
+	Num2           key.Binding
+	Num3           key.Binding
+	Num4           key.Binding
+	Num5           key.Binding
+	Num6           key.Binding
+	Num7           key.Binding
+	Num8           key.Binding
+	Num9           key.Binding
+}
+
+// DefaultRefreshInterval is the default auto-refresh interval
+const DefaultRefreshInterval = 2 * time.Second
+
+// Per-subsystem refresh cadence (driven by DashboardTickMsg)
+const (
+	PaneRefreshInterval        = 1 * time.Second
+	ContextRefreshInterval     = 10 * time.Second
+	AlertsRefreshInterval      = 3 * time.Second
+	BeadsRefreshInterval       = 5 * time.Second
+	CassContextRefreshInterval = 15 * time.Minute
+	ScanRefreshInterval        = 1 * time.Minute
+)
+
+func (m *Model) initRenderer(width int) {
+	r, _ := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(width),
+	)
+	m.renderer = r
+}
+
+var dashKeys = KeyMap{
+	Up:             key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
+	Down:           key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
+	Left:           key.NewBinding(key.WithKeys("left", "h"), key.WithHelp("←/h", "left")),
+	Right:          key.NewBinding(key.WithKeys("right", "l"), key.WithHelp("→/l", "right")),
+	Zoom:           key.NewBinding(key.WithKeys("z", "enter"), key.WithHelp("z/enter", "zoom")),
+	NextPanel:      key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next panel")),
+	PrevPanel:      key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev panel")),
+	Send:           key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "send prompt")),
+	Refresh:        key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+	Pause:          key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause/resume auto-refresh")),
+	Quit:           key.NewBinding(key.WithKeys("q", "esc"), key.WithHelp("q/esc", "quit")),
+	ContextRefresh: key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "refresh context")),
+	MailRefresh:    key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "refresh mail")),
+	CassSearch:     key.NewBinding(key.WithKeys("ctrl+s"), key.WithHelp("ctrl+s", "cass search")),
+	Help:           key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "toggle help")),
+	Diagnostics:    key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "toggle diagnostics")),
+	ScanToggle:     key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "toggle UBS scan")),
+	Tab:            key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next panel")),
+	ShiftTab:       key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev panel")),
+	Num1:           key.NewBinding(key.WithKeys("1")),
+	Num2:           key.NewBinding(key.WithKeys("2")),
+	Num3:           key.NewBinding(key.WithKeys("3")),
+	Num4:           key.NewBinding(key.WithKeys("4")),
+	Num5:           key.NewBinding(key.WithKeys("5")),
+	Num6:           key.NewBinding(key.WithKeys("6")),
+	Num7:           key.NewBinding(key.WithKeys("7")),
+	Num8:           key.NewBinding(key.WithKeys("8")),
+	Num9:           key.NewBinding(key.WithKeys("9")),
+}
+
+// New creates a new dashboard model
+func New(session, projectDir string) Model {
+	t := theme.Current()
+	ic := icons.Current()
+
+	m := Model{
+		session:                    session,
+		projectDir:                 projectDir,
+		width:                      80,
+		height:                     24,
+		tier:                       layout.TierForWidth(80),
+		theme:                      t,
+		icons:                      ic,
+		compaction:                 status.NewCompactionRecoveryIntegrationDefault(),
+		paneStatus:                 make(map[int]PaneStatus),
+		detector:                   status.NewDetector(),
+		agentStatuses:              make(map[string]status.AgentStatus),
+		refreshInterval:            DefaultRefreshInterval,
+		paneRefreshInterval:        PaneRefreshInterval,
+		contextRefreshInterval:     ContextRefreshInterval,
+		alertsRefreshInterval:      AlertsRefreshInterval,
+		beadsRefreshInterval:       BeadsRefreshInterval,
+		cassContextRefreshInterval: CassContextRefreshInterval,
+		scanRefreshInterval:        ScanRefreshInterval,
+		paneOutputLines:            50,
+		paneOutputCaptureBudget:    20,
+		paneOutputCache:            make(map[string]string),
+		paneOutputLastCaptured:     make(map[string]time.Time),
+		renderedOutputCache:        make(map[string]string),
+		healthStatus:               "unknown",
+		healthMessage:              "",
+		cassSearch: components.NewCassSearch(func(hit cass.SearchHit) tea.Cmd {
+			return func() tea.Msg {
+				return CassSelectMsg{Hit: hit}
+			}
+		}),
+		beadsPanel:   panels.NewBeadsPanel(),
+		alertsPanel:  panels.NewAlertsPanel(),
+		metricsPanel: panels.NewMetricsPanel(),
+		historyPanel: panels.NewHistoryPanel(),
+		cassPanel:    panels.NewCASSPanel(),
+		filesPanel:   panels.NewFilesPanel(),
+		tickerPanel:  panels.NewTickerPanel(),
+
+		// Init() kicks off these fetches immediately; mark as fetching so the tick loop
+		// doesn’t pile on duplicates if the first round is still in flight.
+		fetchingSession:     true,
+		fetchingContext:     true,
+		fetchingAlerts:      true,
+		fetchingBeads:       true,
+		fetchingCassContext: true,
+		fetchingMetrics:     true,
+		fetchingHistory:     true,
+		fetchingFileChanges: true,
+	}
+
+	// Initialize last-fetch timestamps to start cadence after the initial fetches from Init.
+	now := time.Now()
+	m.lastPaneFetch = now
+	m.lastContextFetch = now
+	m.lastAlertsFetch = now
+	m.lastBeadsFetch = now
+	m.lastCassContextFetch = now
+	m.lastScanFetch = now
+
+	applyDashboardEnvOverrides(&m)
+
+	// Setup config watcher
+	m.configSub = make(chan *config.Config, 1)
+	// We capture the channel in the closure. Since Model is copied, we must ensure
+	// we use the channel we just created, which is what m.configSub holds.
+	sub := m.configSub
+	closer, err := config.Watch(func(cfg *config.Config) {
+		select {
+		case sub <- cfg:
+		default:
+			// If channel full, drop oldest
+			select {
+			case <-sub:
+			default:
+			}
+			select {
+			case sub <- cfg:
+			default:
+			}
+		}
+	})
+	if err == nil {
+		m.configCloser = closer
+	}
+
+	m.initRenderer(40)
+	return m
+}
+
+// NewWithInterval creates a dashboard with custom refresh interval
+func NewWithInterval(session, projectDir string, interval time.Duration) Model {
+	m := New(session, projectDir)
+	m.refreshInterval = interval
+	return m
+}
+
+// Init implements tea.Model
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(
+		m.tick(),
+		m.fetchSessionDataWithOutputs(),
+		m.fetchHealthStatus(),
+		m.fetchStatuses(),
+		m.fetchAgentMailStatus(),
+		m.fetchBeadsCmd(),
+		m.fetchAlertsCmd(),
+		m.fetchMetricsCmd(),
+		m.fetchHistoryCmd(),
+		m.fetchFileChangesCmd(),
+		m.fetchCASSContextCmd(),
+		m.subscribeToConfig(),
+	)
+}
+
+func (m Model) subscribeToConfig() tea.Cmd {
+	return func() tea.Msg {
+		if m.configSub == nil {
+			return nil
+		}
+		cfg := <-m.configSub
+		return ConfigReloadMsg{Config: cfg}
+	}
+}
+
+func (m Model) tick() tea.Cmd {
+	return tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg {
+		return DashboardTickMsg(t)
+	})
+}
+
+// fetchHealthStatus performs the health check via bv
+func (m Model) fetchHealthStatus() tea.Cmd {
+	return func() tea.Msg {
+		if !bv.IsInstalled() {
+			return HealthCheckMsg{
+				Status:  "unavailable",
+				Message: "bv not installed",
+			}
+		}
+
+		result := bv.CheckDrift(m.projectDir)
+		var status string
+		switch result.Status {
+		case bv.DriftOK:
+			status = "ok"
+		case bv.DriftWarning:
+			status = "warning"
+		case bv.DriftCritical:
+			status = "critical"
+		case bv.DriftNoBaseline:
+			status = "no_baseline"
+		default:
+			status = "unknown"
+		}
+
+		return HealthCheckMsg{
+			Status:  status,
+			Message: result.Message,
+		}
+	}
+}
+
+// fetchScanStatus performs a quick UBS scan for badge display (diff-only)
+func (m Model) fetchScanStatus() tea.Cmd {
+	return m.fetchScanStatusWithContext(context.Background())
+}
+
+func (m Model) fetchScanStatusWithContext(ctx context.Context) tea.Cmd {
+	return func() tea.Msg {
+		if !scanner.IsAvailable() {
+			return ScanStatusMsg{Status: "unavailable"}
+		}
+
+		if ctx == nil {
+			ctx = context.Background()
+		}
+
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+
+		opts := scanner.ScanOptions{
+			DiffOnly: true,
+			Timeout:  15 * time.Second,
+		}
+
+		start := time.Now()
+		result, err := scanner.QuickScanWithOptions(ctx, ".", opts)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if errors.Is(ctxErr, context.Canceled) {
+					return ScanStatusMsg{Err: ctxErr}
+				}
+				return ScanStatusMsg{Status: "error", Err: ctxErr}
+			}
+			if errors.Is(err, context.Canceled) {
+				return ScanStatusMsg{Err: err}
+			}
+			return ScanStatusMsg{Status: "error", Err: err}
+		}
+		if result == nil {
+			return ScanStatusMsg{Status: "unavailable"}
+		}
+
+		status := "clean"
+		switch {
+		case result.Totals.Critical > 0:
+			status = "critical"
+		case result.Totals.Warning > 0:
+			status = "warning"
+		}
+
+		dur := result.Duration
+		if dur == 0 {
+			dur = time.Since(start)
+		}
+
+		return ScanStatusMsg{
+			Status:   status,
+			Totals:   result.Totals,
+			Duration: dur,
+		}
+	}
+}
+
+// fetchAgentMailStatus fetches Agent Mail data (locks, connection status)
+func (m Model) fetchAgentMailStatus() tea.Cmd {
+	return func() tea.Msg {
+		// Get project key from current working directory
+		projectKey, err := os.Getwd()
+		if err != nil {
+			return AgentMailUpdateMsg{Available: false}
+		}
+
+		client := agentmail.NewClient(agentmail.WithProjectKey(projectKey))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// Check availability
+		if !client.IsAvailable() {
+			return AgentMailUpdateMsg{Available: false}
+		}
+
+		// Ensure project exists
+		_, err = client.EnsureProject(ctx, projectKey)
+		if err != nil {
+			return AgentMailUpdateMsg{Available: true, Connected: false}
+		}
+
+		// Fetch file reservations
+		var lockInfo []AgentMailLockInfo
+		reservations, err := client.ListReservations(ctx, projectKey, "", true)
+		if err == nil {
+			for _, r := range reservations {
+				expiresIn := ""
+				if !r.ExpiresTS.IsZero() {
+					remaining := time.Until(r.ExpiresTS)
+					if remaining > 0 {
+						if remaining < time.Minute {
+							expiresIn = fmt.Sprintf("%ds", int(remaining.Seconds()))
+						} else if remaining < time.Hour {
+							expiresIn = fmt.Sprintf("%dm", int(remaining.Minutes()))
+						} else {
+							expiresIn = fmt.Sprintf("%dh%dm", int(remaining.Hours()), int(remaining.Minutes())%60)
+						}
+					} else {
+						expiresIn = "expired"
+					}
+				}
+				lockInfo = append(lockInfo, AgentMailLockInfo{
+					PathPattern: r.PathPattern,
+					AgentName:   r.AgentName,
+					Exclusive:   r.Exclusive,
+					ExpiresIn:   expiresIn,
+				})
+			}
+		}
+
+		return AgentMailUpdateMsg{
+			Available: true,
+			Connected: true,
+			Locks:     len(lockInfo),
+			LockInfo:  lockInfo,
+		}
+	}
+}
+
+func (m Model) refresh() tea.Cmd {
+	return tea.Tick(m.refreshInterval, func(t time.Time) tea.Msg { return RefreshMsg{} })
+}
+
+// Helper struct to carry output data
+type PaneOutputData struct {
+	PaneID       string
+	PaneIndex    int
+	LastActivity time.Time
+	Output       string
+	AgentType    string
+}
+
+type SessionDataWithOutputMsg struct {
+	Panes             []tmux.Pane
+	Outputs           []PaneOutputData
+	Duration          time.Duration
+	NextCaptureCursor int
+	Err               error
+}
+
+func (m Model) fetchSessionDataWithOutputs() tea.Cmd {
+	return m.fetchSessionDataWithOutputsCtx(context.Background())
+}
+
+func (m *Model) requestSessionFetch(cancelInFlight bool) tea.Cmd {
+	m.sessionFetchPending = true
+
+	if m.fetchingSession {
+		if cancelInFlight && m.sessionFetchCancel != nil {
+			m.sessionFetchCancel()
+		}
+		return nil
+	}
+
+	return m.startSessionFetch()
+}
+
+func (m *Model) startSessionFetch() tea.Cmd {
+	if m.fetchingSession || !m.sessionFetchPending {
+		return nil
+	}
+
+	m.sessionFetchPending = false
+	m.fetchingSession = true
+	m.lastPaneFetch = time.Now()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	m.sessionFetchCancel = cancel
+
+	return m.fetchSessionDataWithOutputsCtx(ctx)
+}
+
+func (m *Model) finishSessionFetch() tea.Cmd {
+	m.fetchingSession = false
+	if m.sessionFetchCancel != nil {
+		m.sessionFetchCancel()
+		m.sessionFetchCancel = nil
+	}
+
+	return m.startSessionFetch()
+}
+
+func (m *Model) requestStatusesFetch() tea.Cmd {
+	m.contextFetchPending = true
+
+	if m.fetchingContext {
+		return nil
+	}
+
+	return m.startStatusesFetch()
+}
+
+func (m *Model) startStatusesFetch() tea.Cmd {
+	if m.fetchingContext || !m.contextFetchPending {
+		return nil
+	}
+
+	m.contextFetchPending = false
+	m.fetchingContext = true
+	m.lastContextFetch = time.Now()
+
+	return m.fetchStatuses()
+}
+
+func (m *Model) finishStatusesFetch() tea.Cmd {
+	m.fetchingContext = false
+	return m.startStatusesFetch()
+}
+
+func (m *Model) requestScanFetch(cancelInFlight bool) tea.Cmd {
+	m.scanFetchPending = true
+
+	if m.fetchingScan {
+		if cancelInFlight && m.scanFetchCancel != nil {
+			m.scanFetchCancel()
+		}
+		return nil
+	}
+
+	return m.startScanFetch()
+}
+
+func (m *Model) startScanFetch() tea.Cmd {
+	if m.fetchingScan || !m.scanFetchPending {
+		return nil
+	}
+
+	m.scanFetchPending = false
+	m.fetchingScan = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.scanFetchCancel = cancel
+
+	return m.fetchScanStatusWithContext(ctx)
+}
+
+func (m *Model) finishScanFetch() tea.Cmd {
+	m.fetchingScan = false
+	if m.scanFetchCancel != nil {
+		m.scanFetchCancel()
+		m.scanFetchCancel = nil
+	}
+
+	return m.startScanFetch()
+}
+
+func (m Model) fetchSessionDataWithOutputsCtx(ctx context.Context) tea.Cmd {
+	outputLines := m.paneOutputLines
+	budget := m.paneOutputCaptureBudget
+	startCursor := m.paneOutputCaptureCursor
+	lastCaptured := copyTimeMap(m.paneOutputLastCaptured)
+
+	selectedPaneID := ""
+	if m.cursor >= 0 && m.cursor < len(m.panes) {
+		selectedPaneID = m.panes[m.cursor].ID
+	}
+
+	session := m.session
+
+	return func() tea.Msg {
+		start := time.Now()
+		if ctx == nil {
+			ctx = context.Background()
+		}
+
+		panesWithActivity, err := tmux.GetPanesWithActivityContext(ctx, session)
+		if err != nil {
+			return SessionDataWithOutputMsg{Err: err, Duration: time.Since(start)}
+		}
+
+		panes := make([]tmux.Pane, 0, len(panesWithActivity))
+		for _, pane := range panesWithActivity {
+			panes = append(panes, pane.Pane)
+		}
+
+		plan := planPaneCaptures(panesWithActivity, selectedPaneID, lastCaptured, budget, startCursor)
+
+		var outputs []PaneOutputData
+		for _, pane := range plan.Targets {
+			if err := ctx.Err(); err != nil {
+				return SessionDataWithOutputMsg{Err: err, Duration: time.Since(start)}
+			}
+
+			out, err := tmux.CapturePaneOutputContext(ctx, pane.Pane.ID, outputLines)
+			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return SessionDataWithOutputMsg{Err: ctxErr, Duration: time.Since(start)}
+				}
+				continue
+			}
+
+			outputs = append(outputs, PaneOutputData{
+				PaneID:       pane.Pane.ID,
+				PaneIndex:    pane.Pane.Index,
+				LastActivity: pane.LastActivity,
+				Output:       out,
+				AgentType:    string(pane.Pane.Type), // Simplified mapping
+			})
+		}
+
+		if err := ctx.Err(); err != nil {
+			return SessionDataWithOutputMsg{Err: err, Duration: time.Since(start)}
+		}
+
+		return SessionDataWithOutputMsg{
+			Panes:             panes,
+			Outputs:           outputs,
+			Duration:          time.Since(start),
+			NextCaptureCursor: plan.NextCursor,
+		}
+	}
+}
+
+type paneCapturePlan struct {
+	Targets    []tmux.PaneActivity
+	NextCursor int
+}
+
+func planPaneCaptures(panes []tmux.PaneActivity, selectedPaneID string, lastCaptured map[string]time.Time, budget int, startCursor int) paneCapturePlan {
+	var candidates []tmux.PaneActivity
+	for _, pane := range panes {
+		if pane.Pane.Type == tmux.AgentUser {
+			continue
+		}
+		candidates = append(candidates, pane)
+	}
+
+	if budget <= 0 || len(candidates) == 0 {
+		next := 0
+		if len(candidates) > 0 {
+			next = startCursor % len(candidates)
+			if next < 0 {
+				next = 0
+			}
+		}
+		return paneCapturePlan{Targets: nil, NextCursor: next}
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Pane.Index < candidates[j].Pane.Index
+	})
+
+	if startCursor < 0 {
+		startCursor = 0
+	}
+	startCursor = startCursor % len(candidates)
+
+	selected := make(map[string]struct{}, budget)
+	var targets []tmux.PaneActivity
+
+	if selectedPaneID != "" {
+		for _, pane := range candidates {
+			if pane.Pane.ID == selectedPaneID {
+				selected[pane.Pane.ID] = struct{}{}
+				targets = append(targets, pane)
+				budget--
+				break
+			}
+		}
+	}
+
+	type captureCandidate struct {
+		pane tmux.PaneActivity
+	}
+
+	var needs []captureCandidate
+	if budget > 0 {
+		for _, pane := range candidates {
+			if _, ok := selected[pane.Pane.ID]; ok {
+				continue
+			}
+
+			last, ok := lastCaptured[pane.Pane.ID]
+			if !ok || pane.LastActivity.After(last) {
+				needs = append(needs, captureCandidate{pane: pane})
+			}
+		}
+	}
+
+	sort.Slice(needs, func(i, j int) bool {
+		if needs[i].pane.LastActivity.Equal(needs[j].pane.LastActivity) {
+			return needs[i].pane.Pane.Index < needs[j].pane.Pane.Index
+		}
+		return needs[i].pane.LastActivity.After(needs[j].pane.LastActivity)
+	})
+
+	for _, c := range needs {
+		if budget <= 0 {
+			break
+		}
+		if _, ok := selected[c.pane.Pane.ID]; ok {
+			continue
+		}
+		selected[c.pane.Pane.ID] = struct{}{}
+		targets = append(targets, c.pane)
+		budget--
+	}
+
+	rrSteps := 0
+	for budget > 0 && rrSteps < len(candidates) {
+		idx := (startCursor + rrSteps) % len(candidates)
+		pane := candidates[idx]
+		rrSteps++
+		if _, ok := selected[pane.Pane.ID]; ok {
+			continue
+		}
+		selected[pane.Pane.ID] = struct{}{}
+		targets = append(targets, pane)
+		budget--
+	}
+
+	nextCursor := startCursor
+	if rrSteps > 0 {
+		nextCursor = (startCursor + rrSteps) % len(candidates)
+	}
+
+	return paneCapturePlan{Targets: targets, NextCursor: nextCursor}
+}
+
+func copyTimeMap(src map[string]time.Time) map[string]time.Time {
+	if len(src) == 0 {
+		return nil
+	}
+
+	copied := make(map[string]time.Time, len(src))
+	for k, v := range src {
+		copied[k] = v
+	}
+	return copied
+}
+
+// fetchStatuses runs unified status detection across all panes
+func (m Model) fetchStatuses() tea.Cmd {
+	return func() tea.Msg {
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer cancel()
+
+		statuses, err := m.detector.DetectAllContext(ctx, m.session)
+		duration := time.Since(start)
+		if err != nil {
+			// Keep UI responsive even if detection fails
+			return StatusUpdateMsg{Statuses: nil, Time: time.Now(), Duration: duration, Err: err}
+		}
+		return StatusUpdateMsg{Statuses: statuses, Time: time.Now(), Duration: duration}
+	}
+}
+
+// Update implements tea.Model
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
+	// Handle CASS search updates
+	passToSearch := true
+	if _, ok := msg.(tea.KeyMsg); ok && !m.showCassSearch {
+		passToSearch = false
+	}
+
+	if passToSearch {
+		var cmd tea.Cmd
+		m.cassSearch, cmd = m.cassSearch.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+
+	switch msg := msg.(type) {
+	case CassSelectMsg:
+		m.showCassSearch = false
+		m.healthMessage = fmt.Sprintf("Selected: %s", msg.Hit.Title)
+		return m, tea.Batch(cmds...)
+
+	case BeadsUpdateMsg:
+		m.fetchingBeads = false
+		m.beadsError = msg.Err
+		if msg.Err == nil {
+			m.beadsSummary = msg.Summary
+			m.beadsReady = msg.Ready
+		}
+		m.beadsPanel.SetData(m.beadsSummary, m.beadsReady, m.beadsError)
+		return m, nil
+
+	case AlertsUpdateMsg:
+		m.fetchingAlerts = false
+		m.alertsError = msg.Err
+		if msg.Err == nil {
+			m.activeAlerts = msg.Alerts
+		}
+		m.alertsPanel.SetData(m.activeAlerts, m.alertsError)
+		return m, nil
+
+	case MetricsUpdateMsg:
+		m.fetchingMetrics = false
+		if msg.Err != nil && errors.Is(msg.Err, context.Canceled) {
+			return m, nil
+		}
+		m.metricsError = msg.Err
+		if msg.Err == nil {
+			m.metricsTokens = msg.Data.TotalTokens
+			m.metricsCost = msg.Data.TotalCost
+			m.metricsData = msg.Data
+		}
+		m.metricsPanel.SetData(m.metricsData, m.metricsError)
+		return m, nil
+
+	case HistoryUpdateMsg:
+		m.fetchingHistory = false
+		if msg.Err != nil && errors.Is(msg.Err, context.Canceled) {
+			return m, nil
+		}
+		m.historyError = msg.Err
+		if msg.Err == nil {
+			m.cmdHistory = msg.Entries
+		}
+		m.historyPanel.SetEntries(m.cmdHistory, m.historyError)
+		return m, nil
+
+	case FileChangeMsg:
+		m.fetchingFileChanges = false
+		if msg.Err != nil && errors.Is(msg.Err, context.Canceled) {
+			return m, nil
+		}
+		m.fileChangesError = msg.Err
+		if msg.Err == nil {
+			m.fileChanges = msg.Changes
+		}
+		if m.filesPanel != nil {
+			m.filesPanel.SetData(m.fileChanges, m.fileChangesError)
+		}
+		return m, nil
+
+	case CASSContextMsg:
+		m.fetchingCassContext = false
+		m.cassError = msg.Err
+		m.cassContext = msg.Hits
+		if m.cassPanel != nil {
+			m.cassPanel.SetData(m.cassContext, m.cassError)
+		}
+		return m, nil
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.tier = layout.TierForWidth(msg.Width)
+
+		_, detailWidth := layout.SplitProportions(msg.Width)
+		contentWidth := detailWidth - 4
+		if contentWidth < 20 {
+			contentWidth = 20
+		}
+		m.initRenderer(contentWidth)
+
+		searchW := int(float64(msg.Width) * 0.6)
+		searchH := int(float64(msg.Height) * 0.6)
+		m.cassSearch.SetSize(searchW, searchH)
+
+		return m, tea.Batch(cmds...)
+
+	case DashboardTickMsg:
+		m.animTick++
+
+		// Update ticker panel with current data and animation tick
+		m.updateTickerData()
+
+		// Drive staggered refreshes on the animation ticker to avoid a single heavy burst.
+		now := time.Now()
+		if !m.refreshPaused {
+			if now.Sub(m.lastPaneFetch) >= m.paneRefreshInterval && !m.fetchingSession {
+				if cmd := m.requestSessionFetch(false); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			}
+			if !m.scanDisabled && m.scanRefreshInterval > 0 && now.Sub(m.lastScanFetch) >= m.scanRefreshInterval && !m.fetchingScan {
+				m.lastScanFetch = now
+				if cmd := m.requestScanFetch(false); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			}
+			if now.Sub(m.lastContextFetch) >= m.contextRefreshInterval && !m.fetchingContext {
+				if cmd := m.requestStatusesFetch(); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+
+				if !m.fetchingMetrics {
+					m.fetchingMetrics = true
+					cmds = append(cmds, m.fetchMetricsCmd())
+				}
+				if !m.fetchingHistory {
+					m.fetchingHistory = true
+					cmds = append(cmds, m.fetchHistoryCmd())
+				}
+				if !m.fetchingFileChanges {
+					m.fetchingFileChanges = true
+					cmds = append(cmds, m.fetchFileChangesCmd())
+				}
+			}
+			if now.Sub(m.lastAlertsFetch) >= m.alertsRefreshInterval && !m.fetchingAlerts {
+				m.fetchingAlerts = true
+				cmds = append(cmds, m.fetchAlertsCmd())
+				m.lastAlertsFetch = now
+			}
+			if now.Sub(m.lastBeadsFetch) >= m.beadsRefreshInterval && !m.fetchingBeads {
+				m.fetchingBeads = true
+				m.lastBeadsFetch = now
+				cmds = append(cmds, m.fetchBeadsCmd())
+			}
+			if now.Sub(m.lastCassContextFetch) >= m.cassContextRefreshInterval && !m.fetchingCassContext {
+				m.fetchingCassContext = true
+				m.lastCassContextFetch = now
+				cmds = append(cmds, m.fetchCASSContextCmd())
+			}
+		}
+
+		cmds = append(cmds, m.tick())
+		return m, tea.Batch(cmds...)
+
+	case RefreshMsg:
+		// Trigger async fetches across subsystems (coalesced to avoid pile-up).
+		if cmd := m.requestSessionFetch(false); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if cmd := m.requestStatusesFetch(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if !m.fetchingBeads {
+			m.fetchingBeads = true
+			m.lastBeadsFetch = time.Now()
+			cmds = append(cmds, m.fetchBeadsCmd())
+		}
+		if !m.fetchingAlerts {
+			m.fetchingAlerts = true
+			m.lastAlertsFetch = time.Now()
+			cmds = append(cmds, m.fetchAlertsCmd())
+		}
+		if !m.fetchingMetrics {
+			m.fetchingMetrics = true
+			cmds = append(cmds, m.fetchMetricsCmd())
+		}
+		if !m.fetchingHistory {
+			m.fetchingHistory = true
+			cmds = append(cmds, m.fetchHistoryCmd())
+		}
+		if !m.fetchingFileChanges {
+			m.fetchingFileChanges = true
+			cmds = append(cmds, m.fetchFileChangesCmd())
+		}
+		if !m.fetchingCassContext {
+			m.fetchingCassContext = true
+			m.lastCassContextFetch = time.Now()
+			cmds = append(cmds, m.fetchCASSContextCmd())
+		}
+		return m, tea.Batch(cmds...)
+
+	case SessionDataWithOutputMsg:
+		followUp := m.finishSessionFetch()
+		m.sessionFetchLatency = msg.Duration
+
+		if msg.Err != nil {
+			// Ignore coalescing cancellations; we’ll immediately re-fetch if pending.
+			if !errors.Is(msg.Err, context.Canceled) {
+				m.err = msg.Err
+			}
+			return m, followUp
+		}
+		m.err = nil
+		m.lastRefresh = time.Now()
+
+		{
+			prevSelectedID := ""
+			if m.cursor >= 0 && m.cursor < len(m.panes) {
+				prevSelectedID = m.panes[m.cursor].ID
+			}
+
+			sort.Slice(msg.Panes, func(i, j int) bool {
+				return msg.Panes[i].Index < msg.Panes[j].Index
+			})
+
+			m.panes = msg.Panes
+			m.updateStats()
+			m.paneOutputCaptureCursor = msg.NextCaptureCursor
+
+			if prevSelectedID != "" {
+				for i := range m.panes {
+					if m.panes[i].ID == prevSelectedID {
+						m.cursor = i
+						break
+					}
+				}
+			}
+			if len(m.panes) > 0 && m.cursor >= len(m.panes) {
+				m.cursor = len(m.panes) - 1
+			}
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+
+			if m.paneOutputCache == nil {
+				m.paneOutputCache = make(map[string]string)
+			}
+			if m.paneOutputLastCaptured == nil {
+				m.paneOutputLastCaptured = make(map[string]time.Time)
+			}
+			if m.renderedOutputCache == nil {
+				m.renderedOutputCache = make(map[string]string)
+			}
+
+			// Process compaction checks and context tracking on the main thread using fetched outputs
+			for _, data := range msg.Outputs {
+				if data.PaneID != "" {
+					m.paneOutputCache[data.PaneID] = data.Output
+					if !data.LastActivity.IsZero() {
+						m.paneOutputLastCaptured[data.PaneID] = data.LastActivity
+					}
+				}
+
+				// Find the pane to get the variant
+				var currentPane tmux.Pane
+				found := false
+				for _, p := range m.panes {
+					if p.ID == data.PaneID {
+						currentPane = p
+						found = true
+						break
+					}
+				}
+
+				// Map type string to model name for context limits
+				agentType := "unknown"
+				modelName := ""
+				switch data.AgentType {
+				case string(tmux.AgentClaude):
+					agentType = "claude"
+					if m.cfg != nil {
+						modelName = m.cfg.Models.DefaultClaude
+					} else {
+						modelName = "claude-sonnet-4-20250514"
+					}
+				case string(tmux.AgentCodex):
+					agentType = "codex"
+					if m.cfg != nil {
+						modelName = m.cfg.Models.DefaultCodex
+					} else {
+						modelName = "gpt-4"
+					}
+				case string(tmux.AgentGemini):
+					agentType = "gemini"
+					if m.cfg != nil {
+						modelName = m.cfg.Models.DefaultGemini
+					} else {
+						modelName = "gemini-2.0-flash"
+					}
+				}
+
+				// Use variant if available
+				if found && currentPane.Variant != "" {
+					modelName = currentPane.Variant
+				}
+
+				// Get or create pane status
+				ps := m.paneStatus[data.PaneIndex]
+
+				// Calculate context usage
+				if data.Output != "" && modelName != "" {
+					contextInfo := tokens.GetUsageInfo(data.Output, modelName)
+					ps.ContextTokens = contextInfo.EstimatedTokens
+					ps.ContextLimit = contextInfo.ContextLimit
+					ps.ContextPercent = contextInfo.UsagePercent
+					ps.ContextModel = modelName
+				}
+
+				// Compaction check
+				event, recoverySent, _ := m.compaction.CheckAndRecover(data.Output, agentType, m.session, data.PaneIndex)
+
+				if event != nil {
+					now := time.Now()
+					ps.LastCompaction = &now
+					ps.RecoverySent = recoverySent
+					ps.State = "compacted"
+				}
+
+				m.paneStatus[data.PaneIndex] = ps
+			}
+		}
+		return m, followUp
+
+	case StatusUpdateMsg:
+		followUp := m.finishStatusesFetch()
+		m.statusFetchLatency = msg.Duration
+		m.statusFetchErr = msg.Err
+		// Build index lookup for current panes
+		paneIndexByID := make(map[string]int)
+		for _, p := range m.panes {
+			paneIndexByID[p.ID] = p.Index
+		}
+
+		for _, st := range msg.Statuses {
+			idx, ok := paneIndexByID[st.PaneID]
+			if !ok {
+				continue
+			}
+
+			ps := m.paneStatus[idx]
+			state := string(st.State)
+
+			// Rate limit should be shown with special indicator
+			if st.State == status.StateError && st.ErrorType == status.ErrorRateLimit {
+				state = "rate_limited"
+			} else if ps.LastCompaction != nil && state != string(status.StateError) {
+				// Compaction warning should override idle/working but not errors
+				state = "compacted"
+			}
+			ps.State = state
+
+			// Pre-calculate token velocity
+			ps.TokenVelocity = tokenVelocityFromStatus(st)
+			m.paneStatus[idx] = ps
+			m.agentStatuses[st.PaneID] = st
+
+			// Cache expensive markdown rendering
+			if st.LastOutput != "" && m.renderer != nil {
+				rendered, err := m.renderer.Render(st.LastOutput)
+				if err == nil {
+					if m.renderedOutputCache == nil {
+						m.renderedOutputCache = make(map[string]string)
+					}
+					m.renderedOutputCache[st.PaneID] = rendered
+				}
+			}
+		}
+		m.lastRefresh = msg.Time
+		return m, followUp
+
+	case ConfigReloadMsg:
+		if msg.Config != nil {
+			m.cfg = msg.Config
+			// Update theme
+			m.theme = theme.FromName(msg.Config.Theme)
+			// Reload icons (if dependent on config in future, pass cfg)
+			m.icons = icons.Current()
+
+			// Re-initialize renderer with new theme colors
+			_, detailWidth := layout.SplitProportions(m.width)
+			contentWidth := detailWidth - 4
+			if contentWidth < 20 {
+				contentWidth = 20
+			}
+			m.initRenderer(contentWidth)
+		}
+		return m, m.subscribeToConfig()
+
+	case HealthCheckMsg:
+		m.healthStatus = msg.Status
+		m.healthMessage = msg.Message
+		return m, nil
+
+	case ScanStatusMsg:
+		followUp := m.finishScanFetch()
+		if msg.Err != nil && errors.Is(msg.Err, context.Canceled) {
+			return m, followUp
+		}
+
+		// Only update badge state if the scan actually produced a new result.
+		if msg.Status != "" {
+			m.scanStatus = msg.Status
+			m.scanTotals = msg.Totals
+			m.scanDuration = msg.Duration
+		}
+		return m, followUp
+
+	case AgentMailUpdateMsg:
+		m.agentMailAvailable = msg.Available
+		m.agentMailConnected = msg.Connected
+		m.agentMailLocks = msg.Locks
+		m.agentMailLockInfo = msg.LockInfo
+		return m, nil
+
+	case tea.KeyMsg:
+		// Handle help overlay: Esc or ? closes it
+		if m.showHelp {
+			if msg.String() == "esc" || msg.String() == "?" {
+				m.showHelp = false
+			}
+			return m, nil
+		}
+
+		if m.showCassSearch {
+			if msg.String() == "esc" {
+				m.showCassSearch = false
+			}
+			return m, tea.Batch(cmds...)
+		}
+
+		switch {
+		case key.Matches(msg, dashKeys.NextPanel):
+			m.cycleFocus(1)
+			return m, nil
+
+		case key.Matches(msg, dashKeys.PrevPanel):
+			m.cycleFocus(-1)
+			return m, nil
+		case key.Matches(msg, dashKeys.CassSearch):
+			m.showCassSearch = true
+			searchW := int(float64(m.width) * 0.6)
+			searchH := int(float64(m.height) * 0.6)
+			m.cassSearch.SetSize(searchW, searchH)
+			cmds = append(cmds, m.cassSearch.Init())
+			return m, tea.Batch(cmds...)
+
+		case key.Matches(msg, dashKeys.Help):
+			m.showHelp = !m.showHelp
+			return m, nil
+		case key.Matches(msg, dashKeys.Diagnostics):
+			m.showDiagnostics = !m.showDiagnostics
+			return m, nil
+		case key.Matches(msg, dashKeys.ScanToggle):
+			m.scanDisabled = !m.scanDisabled
+			return m, nil
+
+		case key.Matches(msg, dashKeys.Quit):
+			m.quitting = true
+			return m, tea.Quit
+
+		case key.Matches(msg, dashKeys.Up):
+			if m.cursor > 0 {
+				m.cursor--
+			}
+
+		case key.Matches(msg, dashKeys.Down):
+			if m.cursor < len(m.panes)-1 {
+				m.cursor++
+			}
+
+		case key.Matches(msg, dashKeys.Refresh):
+			// Manual refresh (coalesced; cancels in-flight where supported)
+			var refreshCmds []tea.Cmd
+			if cmd := m.requestSessionFetch(true); cmd != nil {
+				refreshCmds = append(refreshCmds, cmd)
+			}
+			if cmd := m.requestStatusesFetch(); cmd != nil {
+				refreshCmds = append(refreshCmds, cmd)
+			}
+			if cmd := m.requestScanFetch(true); cmd != nil {
+				refreshCmds = append(refreshCmds, cmd)
+			}
+			return m, tea.Batch(refreshCmds...)
+
+		case key.Matches(msg, dashKeys.ContextRefresh):
+			// Force context refresh (same as regular refresh but with user intent to see context)
+			var refreshCmds []tea.Cmd
+			if cmd := m.requestSessionFetch(true); cmd != nil {
+				refreshCmds = append(refreshCmds, cmd)
+			}
+			if cmd := m.requestStatusesFetch(); cmd != nil {
+				refreshCmds = append(refreshCmds, cmd)
+			}
+			if cmd := m.requestScanFetch(true); cmd != nil {
+				refreshCmds = append(refreshCmds, cmd)
+			}
+			return m, tea.Batch(refreshCmds...)
+
+		case key.Matches(msg, dashKeys.MailRefresh):
+			// Refresh Agent Mail data
+			return m, m.fetchAgentMailStatus()
+
+		case key.Matches(msg, dashKeys.Zoom):
+			if len(m.panes) > 0 && m.cursor < len(m.panes) {
+				// Zoom to selected pane
+				p := m.panes[m.cursor]
+				_ = tmux.ZoomPane(m.session, p.Index)
+				return m, tea.Quit
+			}
+
+		// Number quick-select
+		case key.Matches(msg, dashKeys.Num1):
+			m.selectByNumber(1)
+		case key.Matches(msg, dashKeys.Num2):
+			m.selectByNumber(2)
+		case key.Matches(msg, dashKeys.Num3):
+			m.selectByNumber(3)
+		case key.Matches(msg, dashKeys.Num4):
+			m.selectByNumber(4)
+		case key.Matches(msg, dashKeys.Num5):
+			m.selectByNumber(5)
+		case key.Matches(msg, dashKeys.Num6):
+			m.selectByNumber(6)
+		case key.Matches(msg, dashKeys.Num7):
+			m.selectByNumber(7)
+		case key.Matches(msg, dashKeys.Num8):
+			m.selectByNumber(8)
+		case key.Matches(msg, dashKeys.Num9):
+			m.selectByNumber(9)
+		}
+	}
+
+	return m, nil
+}
+
+func (m *Model) selectByNumber(n int) {
+	idx := n - 1
+	if idx >= 0 && idx < len(m.panes) {
+		m.cursor = idx
+	}
+}
+
+func (m *Model) cycleFocus(dir int) {
+	var visiblePanes []PanelID
+	switch {
+	case m.tier >= layout.TierMega:
+		visiblePanes = []PanelID{PanelPaneList, PanelDetail, PanelBeads, PanelAlerts, PanelSidebar}
+	case m.tier >= layout.TierUltra:
+		visiblePanes = []PanelID{PanelPaneList, PanelDetail, PanelSidebar}
+	case m.tier >= layout.TierSplit:
+		visiblePanes = []PanelID{PanelPaneList, PanelDetail}
+	default:
+		visiblePanes = []PanelID{PanelPaneList}
+	}
+
+	// Find current index in visiblePanes
+	currIdx := -1
+	for i, p := range visiblePanes {
+		if p == m.focusedPanel {
+			currIdx = i
+			break
+		}
+	}
+
+	// If not found (e.g. resized from Mega to Split while focus was on Beads), default to 0
+	if currIdx == -1 {
+		currIdx = 0
+	}
+
+	// Cycle
+	nextIdx := (currIdx + dir + len(visiblePanes)) % len(visiblePanes)
+	m.focusedPanel = visiblePanes[nextIdx]
+}
+
+func (m *Model) updateStats() {
+	m.claudeCount = 0
+	m.codexCount = 0
+	m.geminiCount = 0
+	m.userCount = 0
+
+	for _, p := range m.panes {
+		switch p.Type {
+		case tmux.AgentClaude:
+			m.claudeCount++
+		case tmux.AgentCodex:
+			m.codexCount++
+		case tmux.AgentGemini:
+			m.geminiCount++
+		default:
+			m.userCount++
+		}
+	}
+}
+
+// updateTickerData updates the ticker panel with current dashboard data
+func (m *Model) updateTickerData() {
+	// Count active agents (those with "working" state)
+	activeAgents := 0
+	for _, ps := range m.paneStatus {
+		if ps.State == "working" {
+			activeAgents++
+		}
+	}
+
+	// Count alerts by severity
+	var critAlerts, warnAlerts, infoAlerts int
+	for _, a := range m.activeAlerts {
+		switch a.Severity {
+		case alerts.SeverityCritical:
+			critAlerts++
+		case alerts.SeverityWarning:
+			warnAlerts++
+		default:
+			infoAlerts++
+		}
+	}
+
+	// Build ticker data from dashboard state
+	data := panels.TickerData{
+		TotalAgents:     len(m.panes),
+		ActiveAgents:    activeAgents,
+		ClaudeCount:     m.claudeCount,
+		CodexCount:      m.codexCount,
+		GeminiCount:     m.geminiCount,
+		CriticalAlerts:  critAlerts,
+		WarningAlerts:   warnAlerts,
+		InfoAlerts:      infoAlerts,
+		ReadyBeads:      m.beadsSummary.Ready,
+		InProgressBeads: m.beadsSummary.InProgress,
+		BlockedBeads:    m.beadsSummary.Blocked,
+		UnreadMessages:  m.agentMailUnread,
+		ActiveLocks:     m.agentMailLocks,
+		MailConnected:   m.agentMailConnected,
+	}
+
+	m.tickerPanel.SetData(data)
+	m.tickerPanel.SetAnimTick(m.animTick)
+}
+
+// View implements tea.Model
+func (m Model) View() string {
+	t := m.theme
+	ic := m.icons
+
+	var b strings.Builder
+
+	b.WriteString("\n")
+
+	// ═══════════════════════════════════════════════════════════════
+	// HEADER with animated banner (centered)
+	// ═══════════════════════════════════════════════════════════════
+	bannerText := components.RenderBannerMedium(true, m.animTick)
+	center := lipgloss.NewStyle().Width(m.width).Align(lipgloss.Center)
+	b.WriteString(center.Render(bannerText) + "\n")
+
+	// Session title with gradient
+	sessionTitle := ic.Session + "  " + m.session
+	animatedSession := styles.Shimmer(sessionTitle, m.animTick,
+		string(t.Blue), string(t.Lavender), string(t.Mauve))
+	b.WriteString(center.Render(animatedSession) + "\n")
+	if contextLine := m.renderHeaderContextLine(m.width); contextLine != "" {
+		b.WriteString(center.Render(contextLine) + "\n")
+	}
+	b.WriteString(styles.GradientDivider(m.width,
+		string(t.Blue), string(t.Mauve)) + "\n\n")
+
+	// ═══════════════════════════════════════════════════════════════
+	// STATS BAR with agent counts
+	// ═══════════════════════════════════════════════════════════════
+	statsBar := m.renderStatsBar()
+	b.WriteString(center.Render(statsBar) + "\n\n")
+
+	if m.showDiagnostics {
+		diagWidth := m.width - 4
+		if diagWidth < 20 {
+			diagWidth = 20
+		}
+		b.WriteString(m.renderDiagnosticsBar(diagWidth) + "\n\n")
+	}
+
+	// ═══════════════════════════════════════════════════════════════
+	// RATE LIMIT ALERT (if any agent is rate limited)
+	// ═══════════════════════════════════════════════════════════════
+	if alert := m.renderRateLimitAlert(); alert != "" {
+		b.WriteString(alert + "\n\n")
+	}
+
+	// ═══════════════════════════════════════════════════════════════
+	// PANE GRID VISUALIZATION
+	// ═══════════════════════════════════════════════════════════════
+	stateWidth := m.width - 4
+	if stateWidth < 20 {
+		stateWidth = 20
+	}
+
+	if len(m.panes) == 0 {
+		if m.err != nil {
+			b.WriteString(components.ErrorState(m.err.Error(), hintForSessionFetchError(m.err), stateWidth) + "\n")
+		} else if m.fetchingSession {
+			message := "Fetching panes…"
+			if !m.lastPaneFetch.IsZero() {
+				elapsed := time.Since(m.lastPaneFetch).Round(100 * time.Millisecond)
+				if elapsed > 0 {
+					message = fmt.Sprintf("Fetching panes… (%s)", elapsed)
+				}
+			}
+			b.WriteString(components.LoadingState(message, stateWidth) + "\n")
+		} else {
+			b.WriteString(components.RenderEmptyState(components.EmptyStateOptions{
+				Icon:        components.IconEmpty,
+				Title:       "No panes found",
+				Description: "Session has no active panes",
+				Width:       stateWidth,
+				Centered:    true,
+			}) + "\n")
+		}
+	} else {
+		if m.err != nil {
+			b.WriteString(components.ErrorState(m.err.Error(), hintForSessionFetchError(m.err), stateWidth) + "\n\n")
+		}
+		// Responsive layout selection
+		switch {
+		case m.tier >= layout.TierMega:
+			b.WriteString(m.renderMegaLayout() + "\n")
+		case m.tier >= layout.TierUltra:
+			b.WriteString(m.renderUltraLayout() + "\n")
+		case m.tier >= layout.TierSplit:
+			b.WriteString(m.renderSplitView() + "\n")
+		default:
+			b.WriteString(m.renderPaneGrid() + "\n")
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════
+	// TICKER BAR (scrolling status summary)
+	// ═══════════════════════════════════════════════════════════════
+	b.WriteString("\n")
+	m.tickerPanel.SetSize(m.width-4, 1)
+	b.WriteString("  " + m.tickerPanel.View() + "\n")
+
+	// ═══════════════════════════════════════════════════════════════
+	// QUICK ACTIONS BAR (width-gated, only in wide+ modes)
+	// ═══════════════════════════════════════════════════════════════
+	if quickActions := m.renderQuickActions(); quickActions != "" {
+		b.WriteString("  " + quickActions + "\n")
+	}
+
+	// ═══════════════════════════════════════════════════════════════
+	// HELP BAR
+	// ═══════════════════════════════════════════════════════════════
+	b.WriteString("  " + styles.GradientDivider(m.width-4,
+		string(t.Surface2), string(t.Surface1)) + "\n")
+	b.WriteString("  " + m.renderHelpBar() + "\n")
+
+	content := b.String()
+
+	// Show help overlay if toggled
+	if m.showHelp {
+		helpOverlay := components.HelpOverlay(components.HelpOverlayOptions{
+			Title:    "Dashboard Shortcuts",
+			Sections: components.DashboardHelpSections(),
+			MaxWidth: 60,
+		})
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, helpOverlay)
+	}
+
+	if m.showCassSearch {
+		searchView := m.cassSearch.View()
+		modalStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(t.Primary).
+			Background(t.Base).
+			Padding(1, 2)
+		modal := modalStyle.Render(searchView)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal)
+	}
+
+	return content
+}
+
+func (m Model) renderStatsBar() string {
+	t := m.theme
+	ic := m.icons
+
+	var parts []string
+
+	// Health badge (bv drift status)
+	healthBadge := m.renderHealthBadge()
+	if healthBadge != "" {
+		parts = append(parts, healthBadge)
+	}
+
+	// Total panes
+	totalBadge := lipgloss.NewStyle().
+		Background(t.Surface0).
+		Foreground(t.Text).
+		Padding(0, 1).
+		Render(fmt.Sprintf("%s %d panes", ic.Pane, len(m.panes)))
+	parts = append(parts, totalBadge)
+
+	// Claude count
+	if m.claudeCount > 0 {
+		claudeBadge := lipgloss.NewStyle().
+			Background(t.Claude).
+			Foreground(t.Base).
+			Bold(true).
+			Padding(0, 1).
+			Render(fmt.Sprintf("%s %d", ic.Claude, m.claudeCount))
+		parts = append(parts, claudeBadge)
+	}
+
+	// Codex count
+	if m.codexCount > 0 {
+		codexBadge := lipgloss.NewStyle().
+			Background(t.Codex).
+			Foreground(t.Base).
+			Bold(true).
+			Padding(0, 1).
+			Render(fmt.Sprintf("%s %d", ic.Codex, m.codexCount))
+		parts = append(parts, codexBadge)
+	}
+
+	// Gemini count
+	if m.geminiCount > 0 {
+		geminiBadge := lipgloss.NewStyle().
+			Background(t.Gemini).
+			Foreground(t.Base).
+			Bold(true).
+			Padding(0, 1).
+			Render(fmt.Sprintf("%s %d", ic.Gemini, m.geminiCount))
+		parts = append(parts, geminiBadge)
+	}
+
+	// User count
+	if m.userCount > 0 {
+		userBadge := lipgloss.NewStyle().
+			Background(t.Green).
+			Foreground(t.Base).
+			Bold(true).
+			Padding(0, 1).
+			Render(fmt.Sprintf("%s %d", ic.User, m.userCount))
+		parts = append(parts, userBadge)
+	}
+
+	// Scan status badge
+	scanBadge := m.renderScanBadge()
+	if scanBadge != "" {
+		parts = append(parts, scanBadge)
+	}
+
+	// Agent Mail status badge
+	mailBadge := m.renderAgentMailBadge()
+	if mailBadge != "" {
+		parts = append(parts, mailBadge)
+	}
+
+	return strings.Join(parts, "  ")
+}
+
+// renderHealthBadge renders the health badge based on bv drift status
+func (m Model) renderHealthBadge() string {
+	t := m.theme
+
+	if m.healthStatus == "" || m.healthStatus == "unknown" {
+		return ""
+	}
+
+	var bgColor, fgColor lipgloss.Color
+	var icon, label string
+
+	switch m.healthStatus {
+	case "ok":
+		bgColor = t.Green
+		fgColor = t.Base
+		icon = "✓"
+		label = "healthy"
+	case "warning":
+		bgColor = t.Yellow
+		fgColor = t.Base
+		icon = "⚠"
+		label = "drift"
+	case "critical":
+		bgColor = t.Red
+		fgColor = t.Base
+		icon = "✗"
+		label = "critical"
+	case "no_baseline":
+		bgColor = t.Surface1
+		fgColor = t.Overlay
+		icon = "?"
+		label = "no baseline"
+	case "unavailable":
+		return "" // Don't show badge if bv not installed
+	default:
+		return ""
+	}
+
+	return lipgloss.NewStyle().
+		Background(bgColor).
+		Foreground(fgColor).
+		Bold(true).
+		Padding(0, 1).
+		Render(fmt.Sprintf("%s %s", icon, label))
+}
+
+// renderScanBadge renders the UBS scan status badge
+func (m Model) renderScanBadge() string {
+	t := m.theme
+
+	if m.scanStatus == "" || m.scanStatus == "unavailable" {
+		return ""
+	}
+
+	var bgColor, fgColor lipgloss.Color
+	var icon, label string
+
+	switch m.scanStatus {
+	case "clean":
+		bgColor = t.Green
+		fgColor = t.Base
+		icon = "✓"
+		label = "scan clean"
+	case "warning":
+		bgColor = t.Yellow
+		fgColor = t.Base
+		icon = "⚠"
+		label = fmt.Sprintf("scan %d warn", m.scanTotals.Warning)
+	case "critical":
+		bgColor = t.Red
+		fgColor = t.Base
+		icon = "✗"
+		label = fmt.Sprintf("scan %d crit", m.scanTotals.Critical)
+	case "error":
+		bgColor = t.Surface1
+		fgColor = t.Overlay
+		icon = "?"
+		label = "scan error"
+	default:
+		return ""
+	}
+
+	if m.scanStatus == "clean" && (m.scanTotals.Critical+m.scanTotals.Warning+m.scanTotals.Info) > 0 {
+		label = fmt.Sprintf("scan %d/%d/%d", m.scanTotals.Critical, m.scanTotals.Warning, m.scanTotals.Info)
+	}
+
+	return lipgloss.NewStyle().
+		Background(bgColor).
+		Foreground(fgColor).
+		Bold(true).
+		Padding(0, 1).
+		Render(fmt.Sprintf("%s %s", icon, label))
+}
+
+// renderAgentMailBadge renders the Agent Mail status badge
+func (m Model) renderAgentMailBadge() string {
+	t := m.theme
+
+	if !m.agentMailAvailable {
+		return "" // Don't show badge if Agent Mail not available
+	}
+
+	var bgColor, fgColor lipgloss.Color
+	var icon, label string
+
+	if m.agentMailConnected {
+		if m.agentMailLocks > 0 {
+			bgColor = t.Lavender
+			fgColor = t.Base
+			icon = "🔒"
+			label = fmt.Sprintf("%d locks", m.agentMailLocks)
+		} else {
+			bgColor = t.Surface1
+			fgColor = t.Text
+			icon = "📬"
+			label = "mail"
+		}
+	} else {
+		bgColor = t.Yellow
+		fgColor = t.Base
+		icon = "📭"
+		label = "offline"
+	}
+
+	return lipgloss.NewStyle().
+		Background(bgColor).
+		Foreground(fgColor).
+		Bold(true).
+		Padding(0, 1).
+		Render(fmt.Sprintf("%s %s", icon, label))
+}
+
+// renderRateLimitAlert renders a prominent alert banner if any agent is rate limited
+func (m Model) renderRateLimitAlert() string {
+	t := m.theme
+
+	// Check if any pane is rate limited
+	var rateLimitedPanes []int
+	for _, p := range m.panes {
+		if ps, ok := m.paneStatus[p.Index]; ok && ps.State == "rate_limited" {
+			rateLimitedPanes = append(rateLimitedPanes, p.Index)
+		}
+	}
+
+	if len(rateLimitedPanes) == 0 {
+		return ""
+	}
+
+	// Build alert message
+	var msg string
+	if len(rateLimitedPanes) == 1 {
+		msg = fmt.Sprintf("⏳ Rate limit hit on pane %d! Run: ntm rotate %s --pane=%d",
+			rateLimitedPanes[0], m.session, rateLimitedPanes[0])
+	} else {
+		paneList := fmt.Sprintf("%v", rateLimitedPanes)
+		msg = fmt.Sprintf("⏳ Rate limit hit on panes %s! Press 'r' to rotate", paneList)
+	}
+
+	// Render as a prominent alert box
+	alertStyle := lipgloss.NewStyle().
+		Background(t.Maroon).
+		Foreground(t.Base).
+		Bold(true).
+		Padding(0, 2).
+		Width(m.width - 6)
+
+	return "  " + alertStyle.Render(msg)
+}
+
+// renderContextBar renders a progress bar showing context usage percentage
+// High context (>80%) uses shimmer effect on warning indicators
+func (m Model) renderContextBar(percent float64, width int) string {
+	t := m.theme
+
+	// Calculate bar width (leave room for percentage text and warning icon)
+	barWidth := width - 8 // "[████░░] XX%⚠"
+	if barWidth < 5 {
+		barWidth = 5
+	}
+
+	colors := []string{string(t.Green), string(t.Blue), string(t.Yellow), string(t.Red)}
+	barContent := styles.ShimmerProgressBar(percent/100.0, barWidth, "█", "░", m.animTick, colors...)
+
+	percentStyle := lipgloss.NewStyle().Foreground(t.Overlay)
+
+	// Determine warning icon with shimmer effect for high context
+	var warningIcon string
+	switch {
+	case percent >= 95:
+		// Critical: shimmer the warning in red/maroon gradient
+		warningIcon = " " + styles.Shimmer("!!!", m.animTick, string(t.Red), string(t.Maroon), string(t.Red))
+	case percent >= 90:
+		// High: shimmer in red/orange gradient
+		warningIcon = " " + styles.Shimmer("!!", m.animTick, string(t.Red), string(t.Maroon), string(t.Red))
+	case percent >= 80:
+		// Warning: shimmer in yellow/orange gradient
+		warningIcon = " " + styles.Shimmer("!", m.animTick, string(t.Yellow), string(t.Peach), string(t.Yellow))
+	default:
+		warningIcon = ""
+	}
+
+	bar := "[" + barContent + "]" +
+		percentStyle.Render(fmt.Sprintf("%3.0f%%", percent)) +
+		warningIcon
+
+	return bar
+}
+
+func (m Model) renderPaneGrid() string {
+	t := m.theme
+	ic := m.icons
+
+	var lines []string
+
+	// Calculate adaptive card dimensions based on terminal width
+	// Uses beads_viewer-inspired algorithm with min/max constraints
+	const (
+		minCardWidth = 22 // Minimum usable card width
+		maxCardWidth = 45 // Maximum card width for readability
+		cardGap      = 2  // Gap between cards
+	)
+
+	availableWidth := m.width - 4 // Account for margins
+	cardWidth, cardsPerRow := styles.AdaptiveCardDimensions(availableWidth, minCardWidth, maxCardWidth, cardGap)
+
+	// In grid mode (used below Split threshold), show more detail when card width allows it.
+	showExtendedInfo := cardWidth >= 24
+
+	rows := BuildPaneTableRows(m.panes, m.agentStatuses, m.paneStatus, &m.beadsSummary, m.fileChanges, m.animTick, t)
+	contextRanks := m.computeContextRanks()
+
+	var cards []string
+
+	for i, p := range m.panes {
+		row := rows[i]
+		isSelected := i == m.cursor
+
+		// Determine card colors based on agent type
+		var borderColor, iconColor lipgloss.Color
+		var agentIcon string
+
+		switch p.Type {
+		case tmux.AgentClaude:
+			borderColor = t.Claude
+			iconColor = t.Claude
+			agentIcon = ic.Claude
+		case tmux.AgentCodex:
+			borderColor = t.Codex
+			iconColor = t.Codex
+			agentIcon = ic.Codex
+		case tmux.AgentGemini:
+			borderColor = t.Gemini
+			iconColor = t.Gemini
+			agentIcon = ic.Gemini
+		default:
+			borderColor = t.Green
+			iconColor = t.Green
+			agentIcon = ic.User
+		}
+
+		// Selection highlight
+		if isSelected {
+			borderColor = t.Pink
+		}
+
+		// Pulse border for active/working panes (if not selected)
+		if !isSelected && row.Status == "working" && m.animTick > 0 {
+			borderColor = styles.Pulse(string(borderColor), m.animTick)
+		}
+
+		// Build card content
+		var cardContent strings.Builder
+
+		// Header line with icon and title
+		statusIcon := "•"
+		statusColor := t.Overlay
+		switch row.Status {
+		case "working":
+			statusIcon = WorkingSpinnerFrame(m.animTick)
+			statusColor = t.Green
+		case "idle":
+			statusIcon = "○"
+			statusColor = t.Yellow
+		case "error":
+			statusIcon = "✗"
+			statusColor = t.Red
+		case "compacted":
+			statusIcon = "⚠"
+			statusColor = t.Peach
+		case "rate_limited":
+			statusIcon = "⏳"
+			statusColor = t.Maroon
+		}
+		statusStyled := lipgloss.NewStyle().Foreground(statusColor).Bold(true).Render(statusIcon)
+
+		iconStyled := lipgloss.NewStyle().Foreground(iconColor).Bold(true).Render(agentIcon)
+		title := layout.TruncateRunes(p.Title, maxInt(cardWidth-10, 10), "…")
+
+		titleStyled := lipgloss.NewStyle().Foreground(t.Text).Bold(true).Render(title)
+		cardContent.WriteString(statusStyled + " " + iconStyled + " " + titleStyled + "\n")
+
+		// Index badge + compact badges
+		numBadge := lipgloss.NewStyle().
+			Foreground(t.Overlay).
+			Render(fmt.Sprintf("#%d", p.Index))
+
+		var line2Parts []string
+		line2Parts = append(line2Parts, numBadge)
+		if p.Variant != "" {
+			label := layout.TruncateRunes(p.Variant, 12, "…")
+			modelBadge := styles.TextBadge(label, iconColor, t.Base, styles.BadgeOptions{
+				Style:    styles.BadgeStyleCompact,
+				Bold:     false,
+				ShowIcon: false,
+			})
+			line2Parts = append(line2Parts, modelBadge)
+		}
+		if showExtendedInfo {
+			if rank, ok := contextRanks[p.Index]; ok && rank > 0 {
+				rankBadge := styles.RankBadge(rank, styles.BadgeOptions{
+					Style:    styles.BadgeStyleCompact,
+					Bold:     false,
+					ShowIcon: false,
+				})
+				line2Parts = append(line2Parts, rankBadge)
+			}
+		}
+		cardContent.WriteString(strings.Join(line2Parts, " ") + "\n")
+
+		// Bead + activity badges (best-effort)
+		if row.CurrentBead != "" {
+			beadID := row.CurrentBead
+			if parts := strings.SplitN(row.CurrentBead, ": ", 2); len(parts) > 0 {
+				beadID = parts[0]
+			}
+			beadBadge := styles.TextBadge(beadID, t.Mauve, t.Base, styles.BadgeOptions{
+				Style:    styles.BadgeStyleCompact,
+				Bold:     false,
+				ShowIcon: false,
+			})
+			cardContent.WriteString(beadBadge + "\n")
+		}
+
+		var activityBadges []string
+		if row.FileChanges > 0 {
+			activityBadges = append(activityBadges, styles.TextBadge(fmt.Sprintf("Δ%d", row.FileChanges), t.Blue, t.Base, styles.BadgeOptions{
+				Style:    styles.BadgeStyleCompact,
+				Bold:     false,
+				ShowIcon: false,
+			}))
+		}
+		if row.TokenVelocity > 0 && showExtendedInfo {
+			activityBadges = append(activityBadges, styles.TokenVelocityBadge(row.TokenVelocity, styles.BadgeOptions{
+				Style:    styles.BadgeStyleCompact,
+				Bold:     false,
+				ShowIcon: true,
+			}))
+		}
+		if len(activityBadges) > 0 {
+			cardContent.WriteString(strings.Join(activityBadges, " ") + "\n")
+		}
+
+		// Size info - on wide displays show more detail
+		sizeStyle := lipgloss.NewStyle().Foreground(t.Subtext)
+		if showExtendedInfo {
+			cardContent.WriteString(sizeStyle.Render(fmt.Sprintf("%dx%d cols×rows", p.Width, p.Height)) + "\n")
+		} else {
+			cardContent.WriteString(sizeStyle.Render(fmt.Sprintf("%dx%d", p.Width, p.Height)) + "\n")
+		}
+
+		// Command running (if any) - only when there is room
+		if p.Command != "" && showExtendedInfo {
+			cmdStyle := lipgloss.NewStyle().Foreground(t.Overlay).Italic(true)
+			cmd := layout.TruncateRunes(p.Command, maxInt(cardWidth-4, 8), "…")
+			cardContent.WriteString(cmdStyle.Render(cmd))
+		}
+
+		// Context usage bar (best-effort; show in grid when available)
+		if ps, ok := m.paneStatus[p.Index]; ok && ps.ContextLimit > 0 {
+			cardContent.WriteString("\n")
+			contextBar := m.renderContextBar(ps.ContextPercent, cardWidth-4)
+			cardContent.WriteString(contextBar)
+		}
+
+		// Compaction indicator
+		if ps, ok := m.paneStatus[p.Index]; ok && ps.LastCompaction != nil {
+			cardContent.WriteString("\n")
+			compactStyle := lipgloss.NewStyle().Foreground(t.Warning).Bold(true)
+			indicator := "⚠ compacted"
+			if ps.RecoverySent {
+				indicator = "↻ recovering"
+			}
+			cardContent.WriteString(compactStyle.Render(indicator))
+		}
+
+		// Create card box
+		cardStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(borderColor).
+			Width(cardWidth).
+			Padding(0, 1)
+
+		if isSelected {
+			// Add glow effect for selected card
+			cardStyle = cardStyle.
+				Background(t.Surface0)
+		}
+
+		cards = append(cards, cardStyle.Render(cardContent.String()))
+	}
+
+	// Arrange cards in rows
+	for i := 0; i < len(cards); i += cardsPerRow {
+		end := i + cardsPerRow
+		if end > len(cards) {
+			end = len(cards)
+		}
+		row := lipgloss.JoinHorizontal(lipgloss.Top, cards[i:end]...)
+		lines = append(lines, "  "+row)
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// renderQuickActions renders actionable buttons for common operations.
+// Only shows in TierWide and above to avoid cluttering narrow terminals.
+func (m Model) renderQuickActions() string {
+	// Only show in wide modes (TierWide = 200+ cols)
+	if m.tier < layout.TierWide {
+		return ""
+	}
+
+	t := m.theme
+	ic := m.icons
+
+	// Action button style - more prominent than help bar keys
+	buttonStyle := lipgloss.NewStyle().
+		Background(t.Surface1).
+		Foreground(t.Text).
+		Bold(true).
+		Padding(0, 2).
+		MarginRight(1)
+
+	// Disabled button style - dimmed text
+	disabledButtonStyle := buttonStyle.
+		Foreground(t.Surface2)
+
+	// Subtle key hint
+	keyHintStyle := lipgloss.NewStyle().
+		Foreground(t.Overlay).
+		Italic(true)
+
+	type action struct {
+		icon    string
+		label   string
+		key     string
+		enabled bool
+	}
+
+	// Build actions based on current state
+	hasSelection := m.cursor >= 0 && m.cursor < len(m.panes)
+
+	actions := []action{
+		{
+			icon:    ic.Palette,
+			label:   "Palette",
+			key:     "F6",
+			enabled: true,
+		},
+		{
+			icon:    ic.Send,
+			label:   "Send",
+			key:     "s",
+			enabled: hasSelection,
+		},
+		{
+			icon:    ic.Copy,
+			label:   "Copy",
+			key:     "y",
+			enabled: hasSelection,
+		},
+		{
+			icon:    ic.Zoom,
+			label:   "Zoom",
+			key:     "z",
+			enabled: hasSelection,
+		},
+	}
+
+	var parts []string
+
+	// Label for the section
+	labelStyle := lipgloss.NewStyle().
+		Foreground(t.Subtext).
+		Bold(true).
+		MarginRight(2)
+	parts = append(parts, labelStyle.Render("Actions"))
+
+	for _, a := range actions {
+		style := buttonStyle
+		if !a.enabled {
+			style = disabledButtonStyle
+		}
+
+		btn := style.Render(a.icon + " " + a.label)
+		hint := keyHintStyle.Render(" " + a.key)
+		parts = append(parts, btn+hint)
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func (m Model) renderHelpBar() string {
+	// Build hints: global navigation first
+	hints := []components.KeyHint{
+		{Key: "↑↓", Desc: "navigate"},
+		{Key: "1-9", Desc: "select"},
+		{Key: "z", Desc: "zoom"},
+	}
+
+	// Add panel-specific hints (max 3 to avoid overwhelming)
+	panelHints := m.getFocusedPanelHints()
+	for i, hint := range panelHints {
+		if i >= 3 {
+			break
+		}
+		hints = append(hints, hint)
+	}
+
+	// Always end with essential global hints
+	hints = append(hints,
+		components.KeyHint{Key: "r", Desc: "refresh"},
+		components.KeyHint{Key: "?", Desc: "help"},
+		components.KeyHint{Key: "q", Desc: "quit"},
+	)
+
+	// Use the reusable RenderHelpBar component with width-aware truncation.
+	// Hints are progressively hidden from right-to-left when they don’t fit.
+	return components.RenderHelpBar(components.HelpBarOptions{
+		Hints: hints,
+		Width: m.width - 4, // Account for margins
+	})
+}
+
+// getFocusedPanelHints returns keybindings for the currently focused panel as KeyHints.
+func (m Model) getFocusedPanelHints() []components.KeyHint {
+	var keybindings []panels.Keybinding
+
+	switch m.focusedPanel {
+	case PanelBeads:
+		if m.beadsPanel != nil {
+			keybindings = m.beadsPanel.Keybindings()
+		}
+	case PanelAlerts:
+		if m.alertsPanel != nil {
+			keybindings = m.alertsPanel.Keybindings()
+		}
+	case PanelMetrics:
+		if m.metricsPanel != nil {
+			keybindings = m.metricsPanel.Keybindings()
+		}
+	case PanelHistory:
+		if m.historyPanel != nil {
+			keybindings = m.historyPanel.Keybindings()
+		}
+	case PanelSidebar:
+		// Sidebar contains multiple sub-panels; could extend to show focused sub-panel
+		if m.filesPanel != nil && m.filesPanel.IsFocused() {
+			keybindings = m.filesPanel.Keybindings()
+		} else if m.cassPanel != nil && m.cassPanel.IsFocused() {
+			keybindings = m.cassPanel.Keybindings()
+		} else if m.historyPanel != nil && m.historyPanel.IsFocused() {
+			keybindings = m.historyPanel.Keybindings()
+		} else if m.metricsPanel != nil && m.metricsPanel.IsFocused() {
+			keybindings = m.metricsPanel.Keybindings()
+		}
+	}
+
+	// Convert keybindings to KeyHints
+	var hints []components.KeyHint
+	for _, kb := range keybindings {
+		// Skip navigation keys (j/k/up/down) - already shown globally
+		action := kb.Action
+		if action == "up" || action == "down" {
+			continue
+		}
+		hints = append(hints, components.KeyHint{
+			Key:  kb.Key.Help().Key,
+			Desc: action,
+		})
+	}
+	return hints
+}
+
+func (m Model) renderHeaderContextLine(width int) string {
+	if width < 20 {
+		return ""
+	}
+
+	t := m.theme
+
+	var parts []string
+	remote := strings.TrimSpace(tmux.DefaultClient.Remote)
+	if remote == "" {
+		parts = append(parts, "local")
+	} else {
+		parts = append(parts, "ssh "+remote)
+	}
+
+	if !m.lastRefresh.IsZero() {
+		parts = append(parts, "refreshed "+formatRelativeTime(time.Since(m.lastRefresh)))
+	} else if m.fetchingSession || m.fetchingContext {
+		parts = append(parts, "refreshing…")
+	}
+
+	if m.refreshPaused {
+		parts = append(parts, "paused")
+	}
+	if m.scanDisabled {
+		parts = append(parts, "scan off")
+	}
+
+	line := strings.Join(parts, " · ")
+	line = truncateRunes(line, width-4)
+
+	return lipgloss.NewStyle().
+		Foreground(t.Subtext).
+		Render(line)
+}
+
+func formatRelativeTime(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d < 5*time.Second {
+		return "just now"
+	}
+
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	}
+
+	hours := int(d.Hours())
+	if hours < 48 {
+		return fmt.Sprintf("%dh ago", hours)
+	}
+
+	days := hours / 24
+	return fmt.Sprintf("%dd ago", days)
+}
+
+func truncateRunes(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	if maxLen == 1 {
+		return "…"
+	}
+	return string(runes[:maxLen-1]) + "…"
+}
+
+func (m Model) renderDiagnosticsBar(width int) string {
+	t := m.theme
+
+	labelStyle := lipgloss.NewStyle().Foreground(t.Subtext).Bold(true)
+	valueStyle := lipgloss.NewStyle().Foreground(t.Text)
+	warnStyle := lipgloss.NewStyle().Foreground(t.Warning)
+	errStyle := lipgloss.NewStyle().Foreground(t.Error)
+
+	sessionPart := valueStyle.Render("ok")
+	if m.fetchingSession {
+		elapsed := time.Since(m.lastPaneFetch).Round(100 * time.Millisecond)
+		sessionPart = warnStyle.Render("fetching " + elapsed.String())
+	} else if m.sessionFetchLatency > 0 {
+		sessionPart = valueStyle.Render(m.sessionFetchLatency.Round(time.Millisecond).String())
+	}
+	if m.err != nil {
+		sessionPart = errStyle.Render("error")
+	}
+
+	statusPart := valueStyle.Render("ok")
+	if m.fetchingContext {
+		elapsed := time.Since(m.lastContextFetch).Round(100 * time.Millisecond)
+		statusPart = warnStyle.Render("fetching " + elapsed.String())
+	} else if m.statusFetchLatency > 0 {
+		statusPart = valueStyle.Render(m.statusFetchLatency.Round(time.Millisecond).String())
+	}
+	if m.statusFetchErr != nil {
+		statusPart = errStyle.Render("error")
+	}
+
+	parts := []string{
+		labelStyle.Render("diag"),
+		labelStyle.Render("tmux") + ":" + sessionPart,
+		labelStyle.Render("status") + ":" + statusPart,
+	}
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(t.Surface1).
+		Padding(0, 1).
+		Width(width)
+
+	return box.Render(strings.Join(parts, "  "))
+}
+
+func hintForSessionFetchError(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "tmux is responding slowly. Press r to retry, p to pause auto-refresh, or try running ntm outside of tmux"
+	}
+
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "tmux is not installed"):
+		return "Install tmux, then run: ntm deps -v"
+	case strings.Contains(msg, "executable file not found"):
+		return "Install tmux, then run: ntm deps -v"
+	case strings.Contains(msg, "no server running"):
+		return "Start tmux or create a session with: ntm spawn <name>"
+	case strings.Contains(msg, "failed to connect to server"):
+		return "Start tmux or create a session with: ntm spawn <name>"
+	case strings.Contains(msg, "can't find session"), strings.Contains(msg, "session not found"):
+		return "Session may have ended. Create a new one with: ntm spawn <name>"
+	}
+
+	return "Press r to retry"
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SPLIT VIEW RENDERING (for wide terminals ≥110 cols)
+// Inspired by beads_viewer's responsive layout patterns
+// ═══════════════════════════════════════════════════════════════════════════
+
+// renderSplitView renders a two-panel layout: pane list (left) + detail (right)
+func (m Model) renderSplitView() string {
+	t := m.theme
+	leftWidth, rightWidth := layout.SplitProportions(m.width)
+
+	// Calculate content height (leave room for header/footer)
+	contentHeight := m.height - 14
+	if contentHeight < 5 {
+		contentHeight = 5
+	}
+
+	listBorder := t.Surface1
+	if m.focusedPanel == PanelPaneList {
+		listBorder = t.Primary
+	}
+
+	detailBorder := t.Pink
+	if m.focusedPanel == PanelDetail {
+		detailBorder = t.Primary
+	}
+
+	// Build left panel (pane list)
+	listContent := m.renderPaneList(leftWidth - 4) // -4 for borders/padding
+	listPanel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(listBorder).
+		Width(leftWidth).
+		Height(contentHeight).
+		MaxHeight(contentHeight).
+		Padding(0, 1).
+		Render(listContent)
+
+	// Build right panel (detail view)
+	detailContent := m.renderPaneDetail(rightWidth - 4)
+	detailPanel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(detailBorder). // Accent color for detail
+		Width(rightWidth).
+		Height(contentHeight).
+		MaxHeight(contentHeight).
+		Padding(0, 1).
+		Render(detailContent)
+
+	// Join panels horizontally
+	return "  " + lipgloss.JoinHorizontal(lipgloss.Top, listPanel, detailPanel)
+}
+
+// renderUltraLayout renders a three-panel layout: Agents | Detail | Sidebar
+func (m Model) renderUltraLayout() string {
+	t := m.theme
+	leftWidth, centerWidth, rightWidth := layout.UltraProportions(m.width)
+	// The dashboard UI uses a left margin; trim the rightmost panel so the total
+	// rendered width stays within the terminal width at exact thresholds.
+	rightWidth = maxInt(rightWidth-2, 0)
+
+	contentHeight := m.height - 14
+	if contentHeight < 5 {
+		contentHeight = 5
+	}
+
+	listBorder := t.Surface1
+	if m.focusedPanel == PanelPaneList {
+		listBorder = t.Primary
+	}
+
+	detailBorder := t.Pink
+	if m.focusedPanel == PanelDetail {
+		detailBorder = t.Primary
+	}
+
+	sidebarBorder := t.Lavender
+	if m.focusedPanel == PanelSidebar {
+		sidebarBorder = t.Primary
+	}
+
+	listContent := m.renderPaneList(leftWidth - 4)
+	listPanel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(listBorder).
+		Width(leftWidth).
+		Height(contentHeight).
+		MaxHeight(contentHeight).
+		Padding(0, 1).
+		Render(listContent)
+
+	detailContent := m.renderPaneDetail(centerWidth - 4)
+	detailPanel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(detailBorder).
+		Width(centerWidth).
+		Height(contentHeight).
+		MaxHeight(contentHeight).
+		Padding(0, 1).
+		Render(detailContent)
+
+	sidebarContent := m.renderSidebar(rightWidth-4, contentHeight-2)
+	sidebarPanel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(sidebarBorder).
+		Width(rightWidth).
+		Height(contentHeight).
+		MaxHeight(contentHeight).
+		Padding(0, 1).
+		Render(sidebarContent)
+
+	return "  " + lipgloss.JoinHorizontal(lipgloss.Top, listPanel, detailPanel, sidebarPanel)
+}
+
+func (m Model) renderSidebar(width, height int) string {
+	t := m.theme
+	var lines []string
+
+	if width <= 0 {
+		return ""
+	}
+
+	headerStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(t.Text).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderBottom(true).
+		BorderForeground(t.Surface1).
+		Width(width).
+		Padding(0, 1)
+
+	lines = append(lines, headerStyle.Render("Activity & Locks"))
+	lines = append(lines, "")
+
+	if len(m.agentMailLockInfo) > 0 {
+		lines = append(lines, lipgloss.NewStyle().Foreground(t.Lavender).Bold(true).Render("Active Locks"))
+		for _, lock := range m.agentMailLockInfo {
+			lines = append(lines, fmt.Sprintf("🔒 %s", layout.Truncate(lock.PathPattern, width-4)))
+			lines = append(lines, lipgloss.NewStyle().Foreground(t.Subtext).Render(fmt.Sprintf("  by %s (%s)", lock.AgentName, lock.ExpiresIn)))
+		}
+		lines = append(lines, "")
+	} else {
+		lines = append(lines, lipgloss.NewStyle().Foreground(t.Overlay).Italic(true).Render("No active locks"))
+		lines = append(lines, "")
+	}
+
+	// Scan status
+	if m.scanStatus != "" && m.scanStatus != "unavailable" {
+		lines = append(lines, lipgloss.NewStyle().Foreground(t.Blue).Bold(true).Render("Scan Status"))
+		lines = append(lines, m.renderScanBadge())
+	}
+
+	// Metrics (best-effort, height-gated)
+	if m.metricsPanel != nil && height > 0 && (m.metricsError != nil || m.metricsData.TotalTokens > 0 || len(m.metricsData.Agents) > 0) {
+		used := lipgloss.Height(strings.Join(lines, "\n"))
+		spacer := 1
+		panelHeight := height - used - spacer
+		if panelHeight >= m.metricsPanel.Config().MinHeight {
+			if panelHeight > 14 {
+				panelHeight = 14
+			}
+
+			if m.focusedPanel == PanelSidebar {
+				m.metricsPanel.Focus()
+			} else {
+				m.metricsPanel.Blur()
+			}
+			m.metricsPanel.SetSize(width, panelHeight)
+			lines = append(lines, "", m.metricsPanel.View())
+		}
+	}
+
+	// Command history (best-effort, height-gated)
+	if m.historyPanel != nil && height > 0 && (len(m.cmdHistory) > 0 || m.historyError != nil) {
+		used := lipgloss.Height(strings.Join(lines, "\n"))
+		spacer := 1
+		panelHeight := height - used - spacer
+		if panelHeight >= m.historyPanel.Config().MinHeight {
+			if panelHeight > 14 {
+				panelHeight = 14
+			}
+
+			if m.focusedPanel == PanelSidebar {
+				m.historyPanel.Focus()
+			} else {
+				m.historyPanel.Blur()
+			}
+			m.historyPanel.SetSize(width, panelHeight)
+			lines = append(lines, "", m.historyPanel.View())
+		}
+	}
+
+	// File activity (best-effort, height-gated)
+	if m.filesPanel != nil && height > 0 && (len(m.fileChanges) > 0 || m.fileChangesError != nil) {
+		used := lipgloss.Height(strings.Join(lines, "\n"))
+		spacer := 1
+		panelHeight := height - used - spacer
+		if panelHeight >= m.filesPanel.Config().MinHeight {
+			if panelHeight > 14 {
+				panelHeight = 14
+			}
+
+			if m.focusedPanel == PanelSidebar {
+				m.filesPanel.Focus()
+			} else {
+				m.filesPanel.Blur()
+			}
+			m.filesPanel.SetSize(width, panelHeight)
+			lines = append(lines, "", m.filesPanel.View())
+		}
+	}
+
+	// CASS context (best-effort, height-gated)
+	if m.cassPanel != nil && height > 0 {
+		used := lipgloss.Height(strings.Join(lines, "\n"))
+		spacer := 1
+		panelHeight := height - used - spacer
+		if panelHeight >= m.cassPanel.Config().MinHeight {
+			if panelHeight > 14 {
+				panelHeight = 14
+			}
+
+			if m.focusedPanel == PanelSidebar {
+				m.cassPanel.Focus()
+			} else {
+				m.cassPanel.Blur()
+			}
+			m.cassPanel.SetSize(width, panelHeight)
+			lines = append(lines, "", m.cassPanel.View())
+		}
+	}
+
+	// Ensure stable height by padding the sidebar to fill allocated space
+	content := strings.Join(lines, "\n")
+	return panels.FitToHeight(content, height)
+}
+
+// renderMegaLayout renders a five-panel layout: Agents | Detail | Beads | Alerts | Activity
+func (m Model) renderMegaLayout() string {
+	t := m.theme
+	p1, p2, p3, p4, p5 := layout.MegaProportions(m.width)
+	// The dashboard UI uses a left margin; trim the rightmost panel so the total
+	// rendered width stays within the terminal width at exact thresholds.
+	p5 = maxInt(p5-2, 0)
+	p1Inner := maxInt(p1-4, 0)
+	p2Inner := maxInt(p2-4, 0)
+	p3Inner := maxInt(p3-4, 0)
+	p4Inner := maxInt(p4-4, 0)
+	p5Inner := maxInt(p5-4, 0)
+
+	contentHeight := m.height - 14
+	if contentHeight < 5 {
+		contentHeight = 5
+	}
+
+	listBorder := t.Surface1
+	if m.focusedPanel == PanelPaneList {
+		listBorder = t.Primary
+	}
+
+	detailBorder := t.Pink
+	if m.focusedPanel == PanelDetail {
+		detailBorder = t.Primary
+	}
+
+	beadsBorder := t.Green
+	if m.focusedPanel == PanelBeads {
+		beadsBorder = t.Primary
+	}
+
+	alertsBorder := t.Red
+	if m.focusedPanel == PanelAlerts {
+		alertsBorder = t.Primary
+	}
+
+	sidebarBorder := t.Lavender
+	if m.focusedPanel == PanelSidebar {
+		sidebarBorder = t.Primary
+	}
+
+	panel1 := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(listBorder).
+		Width(p1).Height(contentHeight).MaxHeight(contentHeight).
+		Padding(0, 1).
+		Render(m.renderPaneList(p1Inner))
+
+	panel2 := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(detailBorder).
+		Width(p2).Height(contentHeight).MaxHeight(contentHeight).
+		Padding(0, 1).
+		Render(m.renderPaneDetail(p2Inner))
+
+	panel3 := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(beadsBorder).
+		Width(p3).Height(contentHeight).MaxHeight(contentHeight).
+		Padding(0, 1).
+		Render(m.renderBeadsPanel(p3Inner, contentHeight-2))
+
+	panel4 := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(alertsBorder).
+		Width(p4).Height(contentHeight).MaxHeight(contentHeight).
+		Padding(0, 1).
+		Render(m.renderAlertsPanel(p4Inner, contentHeight-2))
+
+	panel5 := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(sidebarBorder).
+		Width(p5).Height(contentHeight).MaxHeight(contentHeight).
+		Padding(0, 1).
+		Render(m.renderSidebar(p5Inner, contentHeight-2))
+
+	return "  " + lipgloss.JoinHorizontal(lipgloss.Top, panel1, panel2, panel3, panel4, panel5)
+}
+
+func (m Model) renderBeadsPanel(width, height int) string {
+	m.beadsPanel.SetSize(width, height)
+	return m.beadsPanel.View()
+}
+
+func (m Model) renderAlertsPanel(width, height int) string {
+	m.alertsPanel.SetSize(width, height)
+	if m.focusedPanel == PanelAlerts {
+		m.alertsPanel.Focus()
+	} else {
+		m.alertsPanel.Blur()
+	}
+	return m.alertsPanel.View()
+}
+
+func (m Model) renderMetricsPanel(width, height int) string {
+	m.metricsPanel.SetSize(width, height)
+	if m.focusedPanel == PanelMetrics {
+		m.metricsPanel.Focus()
+	} else {
+		m.metricsPanel.Blur()
+	}
+	return m.metricsPanel.View()
+}
+
+func (m Model) renderHistoryPanel(width, height int) string {
+	m.historyPanel.SetSize(width, height)
+	if m.focusedPanel == PanelHistory {
+		m.historyPanel.Focus()
+	} else {
+		m.historyPanel.Blur()
+	}
+	return m.historyPanel.View()
+}
+
+// renderPaneList renders a compact list of panes with status indicators
+func (m Model) renderPaneList(width int) string {
+	t := m.theme
+	var lines []string
+
+	// Calculate layout dimensions
+	dims := CalculateLayout(width, 1)
+
+	// Header row
+	lines = append(lines, RenderTableHeader(dims, t))
+
+	// Pane rows (hydrated with status, beads, file changes, with per-agent border colors)
+	rows := BuildPaneTableRows(m.panes, m.agentStatuses, m.paneStatus, &m.beadsSummary, m.fileChanges, m.animTick, t)
+	for i := range rows {
+		rows[i].IsSelected = i == m.cursor
+		lines = append(lines, RenderPaneRow(rows[i], dims, t))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// computeContextRanks returns a 1-based rank per pane index based on context usage (desc).
+// Ties share the same rank.
+func (m Model) computeContextRanks() map[int]int {
+	type pair struct {
+		idx int
+		pct float64
+	}
+
+	var pairs []pair
+	for _, p := range m.panes {
+		if ps, ok := m.paneStatus[p.Index]; ok {
+			pairs = append(pairs, pair{idx: p.Index, pct: ps.ContextPercent})
+		}
+	}
+
+	sort.Slice(pairs, func(i, j int) bool {
+		return pairs[i].pct > pairs[j].pct
+	})
+
+	ranks := make(map[int]int, len(pairs))
+	prevPct := -1.0
+	currentRank := 0
+	for i, pr := range pairs {
+		if prevPct < 0 || pr.pct < prevPct {
+			currentRank = i + 1
+			prevPct = pr.pct
+		}
+		ranks[pr.idx] = currentRank
+	}
+	return ranks
+}
+
+// spinnerDot returns a one-cell dot spinner frame based on the animation tick.
+func spinnerDot(tick int) string {
+	frames := []string{".", "·", "•", "·"}
+	return frames[tick%len(frames)]
+}
+
+// renderPaneDetail renders detailed info for the selected pane
+func (m Model) renderPaneDetail(width int) string {
+	t := m.theme
+	ic := m.icons
+
+	if len(m.panes) == 0 || m.cursor >= len(m.panes) {
+		emptyStyle := lipgloss.NewStyle().Foreground(t.Overlay).Italic(true)
+		return emptyStyle.Render("No pane selected")
+	}
+
+	p := m.panes[m.cursor]
+	ps := m.paneStatus[p.Index]
+	var lines []string
+
+	// Header with pane title
+	headerStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(t.Text).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderBottom(true).
+		BorderForeground(t.Surface1).
+		Width(width-2).
+		Padding(0, 1)
+	lines = append(lines, headerStyle.Render(p.Title))
+	lines = append(lines, "")
+
+	// Info grid
+	labelStyle := lipgloss.NewStyle().Foreground(t.Subtext).Width(12)
+	valueStyle := lipgloss.NewStyle().Foreground(t.Text)
+
+	// Type badge
+	var typeColor lipgloss.Color
+	var typeIcon string
+	switch p.Type {
+	case tmux.AgentClaude:
+		typeColor = t.Claude
+		typeIcon = ic.Claude
+	case tmux.AgentCodex:
+		typeColor = t.Codex
+		typeIcon = ic.Codex
+	case tmux.AgentGemini:
+		typeColor = t.Gemini
+		typeIcon = ic.Gemini
+	default:
+		typeColor = t.Green
+		typeIcon = ic.User
+	}
+	typeBadge := lipgloss.NewStyle().
+		Background(typeColor).
+		Foreground(t.Base).
+		Bold(true).
+		Padding(0, 1).
+		Render(typeIcon + " " + string(p.Type))
+	lines = append(lines, labelStyle.Render("Type:")+typeBadge)
+
+	// Index
+	lines = append(lines, labelStyle.Render("Index:")+valueStyle.Render(fmt.Sprintf("%d", p.Index)))
+
+	// Dimensions
+	lines = append(lines, labelStyle.Render("Size:")+valueStyle.Render(fmt.Sprintf("%d × %d", p.Width, p.Height)))
+
+	// Variant/Model
+	if p.Variant != "" {
+		variantBadge := lipgloss.NewStyle().
+			Background(t.Surface1).
+			Foreground(t.Text).
+			Padding(0, 1).
+			Render(p.Variant)
+		lines = append(lines, labelStyle.Render("Model:")+variantBadge)
+	}
+
+	lines = append(lines, "")
+
+	// Context usage section
+	if ps.ContextLimit > 0 {
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(t.Lavender).Render("Context Usage"))
+		lines = append(lines, "")
+
+		// Large context bar
+		barWidth := width - 10
+		if barWidth < 10 {
+			barWidth = 10
+		} else if barWidth > 50 {
+			barWidth = 50
+		}
+		contextBar := m.renderContextBar(ps.ContextPercent, barWidth)
+		lines = append(lines, "  "+contextBar)
+
+		// Stats
+		statsStyle := lipgloss.NewStyle().Foreground(t.Subtext)
+		lines = append(lines, statsStyle.Render(fmt.Sprintf(
+			"  %d / %d tokens (%.1f%%)",
+			ps.ContextTokens, ps.ContextLimit, ps.ContextPercent,
+		)))
+		lines = append(lines, "")
+
+		// Legend for thresholds (kept compact and ASCII-safe)
+		legend := lipgloss.JoinHorizontal(
+			lipgloss.Top,
+			lipgloss.NewStyle().Foreground(t.Green).Render("green<40%"),
+			lipgloss.NewStyle().Foreground(t.Blue).Render("  blue<60%"),
+			lipgloss.NewStyle().Foreground(t.Yellow).Render("  yellow<80%"),
+			lipgloss.NewStyle().Foreground(t.Red).Render("  red≥80%"),
+		)
+		lines = append(lines, "  "+legend)
+		lines = append(lines, "")
+	}
+
+	// Status section
+	lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(t.Lavender).Render("Status"))
+	lines = append(lines, "")
+
+	statusText := ps.State
+	if statusText == "" {
+		statusText = "unknown"
+	}
+	var statusColor lipgloss.Color
+	var statusIcon string
+	switch ps.State {
+	case "working":
+		// Animated spinner for working state
+		statusIcon = WorkingSpinnerFrame(m.animTick)
+		statusColor = t.Green
+	case "idle":
+		statusIcon = "○"
+		statusColor = t.Yellow
+	case "error":
+		statusIcon = "✗"
+		statusColor = t.Red
+	case "compacted":
+		statusIcon = "⚠"
+		statusColor = t.Peach
+	default:
+		statusIcon = "•"
+		statusColor = t.Overlay
+	}
+	lines = append(lines, "  "+lipgloss.NewStyle().Foreground(statusColor).Render(statusIcon+" "+statusText))
+
+	// Project Health (if warning/critical)
+	if m.healthStatus == "warning" || m.healthStatus == "critical" {
+		lines = append(lines, "")
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(t.Yellow).Render("Project Health"))
+		lines = append(lines, "")
+		msg := wordwrap.String(m.healthMessage, width-4)
+		lines = append(lines, "  "+lipgloss.NewStyle().Foreground(t.Warning).Render(msg))
+	}
+
+	// Global Locks (TierWide+)
+	if m.tier >= layout.TierWide && len(m.agentMailLockInfo) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(t.Lavender).Render("Active Locks"))
+		lines = append(lines, "")
+		for i, lock := range m.agentMailLockInfo {
+			if i >= 5 {
+				lines = append(lines, fmt.Sprintf("  ...and %d more", len(m.agentMailLockInfo)-5))
+				break
+			}
+			lines = append(lines, fmt.Sprintf("  🔒 %s (%s)", layout.Truncate(lock.PathPattern, 20), lock.AgentName))
+		}
+	}
+
+	// Compaction warning
+	if ps.LastCompaction != nil {
+		lines = append(lines, "")
+		warnStyle := lipgloss.NewStyle().Foreground(t.Peach).Bold(true)
+		lines = append(lines, warnStyle.Render("  ⚠ Context compaction detected"))
+		if ps.RecoverySent {
+			lines = append(lines, lipgloss.NewStyle().Foreground(t.Green).Render("    ↻ Recovery prompt sent"))
+		}
+	}
+
+	// Command (if running)
+	if p.Command != "" {
+		lines = append(lines, "")
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(t.Lavender).Render("Command"))
+		lines = append(lines, "")
+		cmdStyle := lipgloss.NewStyle().
+			Foreground(t.Overlay).
+			Italic(true).
+			Width(width - 6)
+		lines = append(lines, "  "+cmdStyle.Render(p.Command))
+	}
+
+	// Recent Output (rendered with glamour)
+	if st, ok := m.agentStatuses[p.ID]; ok && st.LastOutput != "" && m.renderer != nil {
+		lines = append(lines, "")
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(t.Lavender).Render("Recent Output"))
+		lines = append(lines, "")
+
+		// Use cached rendering if available
+		if cached, ok := m.renderedOutputCache[p.ID]; ok {
+			lines = append(lines, cached)
+		} else {
+			// Fallback (should be covered by cache update, but safe default)
+			rendered, err := m.renderer.Render(st.LastOutput)
+			if err == nil {
+				m.renderedOutputCache[p.ID] = rendered
+				lines = append(lines, rendered)
+			} else {
+				lines = append(lines, layout.Truncate(st.LastOutput, 500))
+			}
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// Run starts the dashboard
+func Run(session, projectDir string) error {
+	model := New(session, projectDir)
+	p := tea.NewProgram(model, tea.WithAltScreen())
+	_, err := p.Run()
+	return err
+}
