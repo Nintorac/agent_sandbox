@@ -1,0 +1,61 @@
+version: 2
+
+project_name: caam
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: caam
+    main: ./cmd/caam
+    binary: caam
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version={{.Version}}
+      - -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit={{.ShortCommit}}
+      - -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date={{.Date}}
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: Dicklesworthstone
+    name: coding_agent_account_manager
+  draft: false
+  prerelease: auto
