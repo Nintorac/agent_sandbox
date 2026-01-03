@@ -1,0 +1,35 @@
+# Binaries
+/gt
+*.exe
+
+# Build
+/dist/
+/build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+coverage.out
+*.test
+
+# Local config
+config.toml
+!config.example.toml
+gt
+
+# Runtime state
+state.json
+.runtime/
+.beads/redirect
+
+# Clone-specific CLAUDE.md (regenerated locally per clone)
+CLAUDE.md
