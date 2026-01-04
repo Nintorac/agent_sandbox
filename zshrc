@@ -18,6 +18,9 @@ alias ll='lsd -la'
 alias lt='lsd --tree'
 alias cat='bat --paging=never'
 
+# Podman requires sudo for nested containers
+alias podman='sudo podman'
+
 # Coding agent velocity aliases (vibe mode)
 alias cc='NODE_OPTIONS="--max-old-space-size=32768" ENABLE_BACKGROUND_TASKS=1 claude --dangerously-skip-permissions'
 alias cod='codex --dangerously-bypass-approvals-and-sandbox'

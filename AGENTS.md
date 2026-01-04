@@ -255,3 +255,77 @@ After build, these binaries are available in the container:
 | `claude` | Claude Code | Anthropic's coding agent |
 | `codex` | Codex CLI | OpenAI's coding agent |
 | `gemini` | Gemini CLI | Google's coding agent |
+
+---
+
+## Development Cycle
+
+### Quick Reference
+
+```bash
+# Build → Sync → Test cycle
+make build          # Build image (parallel stages)
+make sync-image     # Copy to yolo user's podman storage
+make test-smoke     # Run 41 validation tests
+```
+
+### Build Phase
+
+```bash
+make build              # Parallel multi-stage build (~5 min)
+make build-nocache      # Full rebuild from scratch
+make build-progress     # Verbose output for debugging
+```
+
+**Important:** Always run builds in the background to avoid timeouts and allow monitoring:
+```bash
+# In Claude Code: use run_in_background=true, don't pipe to tail
+# Check progress with: tail -f /tmp/.../tasks/<id>.output
+```
+
+The Dockerfile uses 4 parallel builder stages:
+- **go-builder**: ntm, bv, gt, caam, slb
+- **rust-builder**: cass (requires nightly for edition 2024)
+- **node-builder**: cm (bun compile)
+- **python-builder**: mcp_agent_mail
+
+### Sync Phase
+
+```bash
+make sync-image
+```
+
+Required because smoke tests run as the `yolo` user (security isolation). This exports the image from your podman storage and imports it into yolo's.
+
+### Test Phase
+
+```bash
+make test-smoke
+```
+
+Validates 41 checks across:
+- Go/Rust/Node binaries
+- AI Agent CLIs (claude, codex, gemini)
+- Language runtimes (node, cargo, rustc, python, go, bun)
+- Cargo utilities (lsd, zoxide, atuin, starship, bat, eza)
+- Container tools (podman, buildah, skopeo)
+- Nested container support (podman-in-podman)
+- System tools (git, tmux, zsh, rg, fd, fzf, jq, yq)
+- Security isolation (RFC1918 blocked, user isolation, homedir isolation)
+
+### Run Phase
+
+```bash
+make run            # Interactive shell
+make run-build      # Build + run
+./run.sh            # Direct launcher with mount options
+```
+
+### Typical Development Loop
+
+1. Edit `Dockerfile`, `entrypoint.sh`, `zshrc`, or vendored tools
+2. `make build`
+3. `make sync-image` (if testing with yolo user)
+4. `make test-smoke`
+5. `make run` to test interactively
+6. Commit changes

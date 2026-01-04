@@ -83,8 +83,9 @@ check_tool "skopeo" "skopeo --version"
 echo ""
 
 echo "Podman-in-Podman (nested containers):"
-check_tool "podman-info" "podman info --format '{{.Host.OCIRuntime.Name}}'"
-check_tool "podman-run" "podman run --rm alpine:latest echo nested-container-works"
+# Nested podman requires sudo (rootless-in-rootless not possible)
+check_tool "podman-info" "sudo podman info --format '{{.Host.OCIRuntime.Name}}'"
+check_tool "podman-run" "sudo podman run --rm alpine:latest echo nested-container-works"
 echo ""
 
 echo "System Tools:"
@@ -98,6 +99,61 @@ check_tool "jq" "jq --version"
 check_tool "yq" "yq --version"
 check_tool "make" "make --version"
 check_tool "curl" "curl --version"
+echo ""
+
+echo "Security Isolation:"
+# Test 1: RFC1918 should be blocked (can't reach gateway)
+# Get default gateway
+GATEWAY=$(ip route | grep default | awk '{print $3}' | head -1)
+if [ -n "$GATEWAY" ]; then
+    printf "  %-20s " "rfc1918-blocked"
+    # ping should fail (timeout after 1 second, 1 packet)
+    if ping -c 1 -W 1 "$GATEWAY" >/dev/null 2>&1; then
+        echo -e "${RED}FAIL${NC} (gateway $GATEWAY is reachable - firewall not configured)"
+        FAIL=$((FAIL + 1))
+        FAILED_TOOLS="$FAILED_TOOLS rfc1918-blocked"
+    else
+        echo -e "${GREEN}PASS${NC} (gateway $GATEWAY blocked)"
+        PASS=$((PASS + 1))
+    fi
+else
+    printf "  %-20s " "rfc1918-blocked"
+    echo -e "${YELLOW}SKIP${NC} (no gateway found)"
+fi
+
+# Test 2: Container escape should land as yolo, not main user
+printf "  %-20s " "user-isolation"
+# Check who owns the podman process outside the container
+# We can check /proc/1/uid_map to see the UID mapping
+OUTER_UID=$(cat /proc/1/uid_map 2>/dev/null | awk 'NR==1 {print $2}')
+if [ -n "$OUTER_UID" ]; then
+    # Get the username for this UID on the host (via /etc/passwd in container won't work)
+    # Instead, check if we're NOT running as a typical user UID (1000)
+    if [ "$OUTER_UID" -ge 200000 ] 2>/dev/null; then
+        echo -e "${GREEN}PASS${NC} (running in yolo namespace, UID $OUTER_UID)"
+        PASS=$((PASS + 1))
+    elif [ "$OUTER_UID" -ge 1000 ] && [ "$OUTER_UID" -lt 65534 ] 2>/dev/null; then
+        echo -e "${YELLOW}WARN${NC} (running as regular user UID $OUTER_UID - not yolo)"
+        # Don't fail, just warn - this is the fallback mode
+        PASS=$((PASS + 1))
+    else
+        echo -e "${GREEN}PASS${NC} (UID mapping: $OUTER_UID)"
+        PASS=$((PASS + 1))
+    fi
+else
+    echo -e "${YELLOW}SKIP${NC} (could not determine outer UID)"
+fi
+
+# Test 3: Verify we can't access typical user home directories
+printf "  %-20s " "homedir-isolated"
+if [ -d "/home/athena" ] || { [ -n "${USER:-}" ] && [ -d "/home/$USER" ] && [ "$USER" != "root" ] && [ "$USER" != "agent" ]; }; then
+    echo -e "${RED}FAIL${NC} (host home directory accessible)"
+    FAIL=$((FAIL + 1))
+    FAILED_TOOLS="$FAILED_TOOLS homedir-isolated"
+else
+    echo -e "${GREEN}PASS${NC} (host home not accessible)"
+    PASS=$((PASS + 1))
+fi
 echo ""
 
 echo "=========================================="

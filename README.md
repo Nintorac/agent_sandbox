@@ -13,10 +13,16 @@ A Fedora-based development container for AI agent workflows with podman-in-podma
 ## Quick Start
 
 ```bash
-# Build the container (with parallel stages)
+# 1. Set up isolated yolo user (one-time, requires sudo)
+sudo ./setup-host.sh
+
+# 2. Build the container
 make build
 
-# Run with your project mounted
+# 3. Sync image to yolo user
+make sync-image
+
+# 4. Run with your project mounted
 cd /path/to/your/project
 ./run.sh
 ```
@@ -35,17 +41,33 @@ make run-build
 ./run.sh -s ~/projects/frontend -s ~/projects/backend
 ```
 
+> **Note:** If yolo user is not set up, run.sh will fall back to running as your user (less secure).
+
 ### Makefile Targets
 
 | Target | Description |
 |--------|-------------|
 | `make build` | Build with parallel stages (recommended) |
 | `make build-nocache` | Full rebuild without cache |
+| `make sync-image` | Copy image from your user to yolo user |
 | `make run` | Run the container |
 | `make run-build` | Build and run |
+| `make test-smoke` | Run smoke tests (tools + security) |
 | `make clean` | Remove build cache |
 | `make reset` | Remove workspace volume (destroys agent work) |
 | `make help` | Show all available targets |
+
+### Recommended Host Aliases
+
+Add these to your host's `~/.bashrc` or `~/.zshrc` for convenience:
+
+```bash
+alias yolo='sudo -u yolo'
+alias agent='sudo -u yolo podman exec -it -u agent agent-dev zsh'
+```
+
+- `yolo` - Run any command as the isolated yolo user
+- `agent` - Attach to a running container as the agent user
 
 ## The Source/Workspace Workflow
 
@@ -98,18 +120,6 @@ Mount multiple projects under `/source`:
 
 ```bash
 ./run.sh -s ~/projects/frontend -s ~/projects/backend -s ~/projects/shared-lib
-```
-
-Or manually:
-
-```bash
-podman run -it --rm \
-    --privileged \
-    -v ~/projects/frontend:/source/frontend:ro,z \
-    -v ~/projects/backend:/source/backend:ro,z \
-    -v ~/projects/shared-lib:/source/shared-lib:ro,z \
-    -v agent-workspace:/workspace \
-    agent-dev:latest
 ```
 
 Then add each as a rig:
@@ -249,6 +259,22 @@ See [AGENTS.md](./AGENTS.md) for detailed subtree management instructions.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
+│  HOST                                                        │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  Your User (athena)                                    │  │
+│  │  └── Builds image, invokes run.sh                     │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                           │                                  │
+│                           │ sudo -u yolo podman run         │
+│                           ▼                                  │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  Isolated User (yolo)                                  │  │
+│  │  └── Rootless podman, no secrets, RFC1918 blocked     │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                           │                                  │
+└───────────────────────────│──────────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
 │                    Agent Dev Container                       │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │  /source (read-only mount)                           │   │
@@ -266,7 +292,7 @@ See [AGENTS.md](./AGENTS.md) for detailed subtree management instructions.
 │  └─────────────────────────────────────────────────────┘   │
 │                                                              │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │  Nested Podman (privileged)                          │   │
+│  │  Nested Podman (fuse-overlayfs)                      │   │
 │  │  └── Can run builds, tests, local deployments       │   │
 │  └─────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
@@ -306,77 +332,108 @@ See [AGENTS.md](./AGENTS.md) for detailed subtree management instructions.
 
 This container is hardened for AI agents running in autonomous mode (YOLO mode).
 
-### Host Protection
+### Threat Model
 
-| Protection | Status |
-|------------|--------|
-| No `--privileged` flag | Container cannot access host devices or load kernel modules |
-| No `/dev/fuse` exposure | Uses kernel-native overlay (requires host kernel 5.13+) |
-| No `unmask=ALL` | Sensitive `/proc` and `/sys` paths remain masked |
-| Read-only source mounts | Agent cannot modify your original code (`:ro` flag) |
-| User namespace isolation | Container UID maps to your host UID |
+The agent container runs as a dedicated, low-privilege host user (`yolo`) with:
+- No secrets or SSH access
+- No cloud credentials
+- No access to developer home directories
 
-### What the Container CAN Do
+**Compromise of the agent may destroy the dev machine, but cannot compromise developer identity, laptops, or infrastructure.**
 
-- Run nested containers (podman-in-podman) via native overlay
-- Access network (for package managers, APIs)
-- Write to `/workspace` volume
-- Execute arbitrary code within the container
+### Host Setup
 
-### What the Container CANNOT Do
+```bash
+# One-time setup (creates yolo user + firewall rules)
+sudo ./setup-host.sh
+```
 
-- Access host filesystem outside mounted volumes
-- Load kernel modules
-- Read `/proc/kcore` (host memory)
-- Access `/proc/keys` (cryptographic keys)
-- Modify cgroups or escape to host namespace
-- See or access host devices
+This creates a dedicated `yolo` user that:
+- Owns nothing of value
+- Has no SSH agent forwarding
+- Cannot access RFC1918 subnets (internal network blocked)
+- Runs podman in rootless mode
 
-### Requirements
+### Container Flags
 
-- **Host kernel 5.13+** for native overlay in user namespaces
-- Podman with rootless support
+| Flag | Purpose |
+|------|---------|
+| `--user root` | Root-in-container for nested runtime support |
+| `--security-opt label=disable` | Required for nested mounts on SELinux |
+| `--cap-add CAP_SETUID/SETGID` | UID/GID ops for nested containers |
+| `--cap-add CAP_SYS_ADMIN` | Mount namespace ops for nested podman |
+| `--device /dev/fuse` | fuse-overlayfs storage driver |
 
-Check your kernel version: `uname -r`
+**NOT used:** `--privileged`, `--userns=host`, block device access
+
+### Risk Envelope
+
+| Impact | Outcome |
+|--------|---------|
+| Agent compromise | Dev machine destruction/DoS possible |
+| Kernel escape | Only compromises dedicated `yolo` user |
+| Developer identity | **Protected** |
+| Infrastructure/prod | **Protected** |
+| Laptop credentials | **Protected** |
+
+### Verification
+
+```bash
+# Run smoke tests including security checks
+make test-smoke
+```
+
+Tests verify:
+- RFC1918 subnets blocked (can't reach gateway)
+- User isolation (running as yolo, not your user)
+- Home directory isolation (can't see /home/athena)
+
+See [docs/SECURITY.md](docs/SECURITY.md) for full architecture details.
 
 ## Troubleshooting
 
 ### Nested containers not working
 
-1. **Check kernel version** - must be 5.13+ for native overlay:
+1. **Ensure yolo user is set up**:
    ```bash
-   uname -r
+   sudo ./setup-host.sh
    ```
 
-2. **Reset podman storage** if switching from fuse-overlayfs:
+2. **Sync image to yolo user**:
    ```bash
-   # Inside container
-   podman system reset
+   make sync-image
    ```
 
-3. **Verify overlay driver**:
+3. **Reset podman storage** if corrupted:
    ```bash
-   podman info | grep -A2 graphDriverName
+   sudo -u yolo podman system reset
    ```
+
+### "yolo user not found" warning
+
+Run the host setup script:
+```bash
+sudo ./setup-host.sh
+```
 
 ### Permission issues
 
-The container uses `--userns=keep-id` to map your host UID. If you see permission errors:
+If you see permission errors:
 
 ```bash
 # Reset the workspace volume
 ./run.sh --reset
 ```
 
-### Storage driver errors
+### Firewall not blocking internal network
 
-If you see "overlay-on-overlay" errors:
-
+Check firewall rules are applied:
 ```bash
-# Check storage configuration
-podman info | grep -A5 storage
+# For nftables
+sudo nft list table inet yolo_restrict
 
-# Volumes should be using native storage, not overlay mounts
+# For iptables
+sudo iptables -L OUTPUT -n | grep $(id -u yolo)
 ```
 
 ## References

@@ -208,6 +208,10 @@ RUN dnf install -y \
     less \
     vim-minimal \
     which \
+    sudo \
+    # Network tools (for smoke tests)
+    iproute \
+    iputils \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 
@@ -235,12 +239,16 @@ RUN useradd -m -s /usr/bin/zsh agent \
     && mkdir -p /home/agent/.local/bin \
     && mkdir -p /home/agent/.config \
     && mkdir -p /home/agent/.cache \
-    && chown -R agent:agent /home/agent
+    && chown -R agent:agent /home/agent \
+    && echo "agent ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/agent \
+    && chmod 440 /etc/sudoers.d/agent
 
 # Configure podman for nested containers
 COPY containers.conf /etc/containers/containers.conf
 COPY storage.conf /etc/containers/storage.conf
-RUN chmod 644 /etc/containers/containers.conf /etc/containers/storage.conf
+RUN chmod 644 /etc/containers/containers.conf /etc/containers/storage.conf \
+    && chmod 4755 /usr/bin/newuidmap \
+    && chmod 4755 /usr/bin/newgidmap
 
 # Create rootless storage directories
 RUN mkdir -p /home/agent/.local/share/containers/storage \

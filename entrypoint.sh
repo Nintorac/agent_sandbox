@@ -156,7 +156,13 @@ main() {
     echo "  ntm           - Named Tmux Manager"
     echo ""
 
-    # Execute the command passed to the container
+    # Switch to agent user if running as root
+    # setpriv: no PAM, preserves env, preserves groups with --init-groups
+    if [ "$(id -u)" = "0" ]; then
+        cd /workspace
+        export HOME=/home/agent
+        exec setpriv --reuid=agent --regid=agent --init-groups -- "$@"
+    fi
     exec "$@"
 }
 

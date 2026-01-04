@@ -125,7 +125,7 @@ if [ ${#SOURCE_MOUNTS[@]} -eq 0 ]; then
     # Default: mount current directory as source
     if [ -d ".git" ] || [ -f "package.json" ] || [ -f "Cargo.toml" ] || [ -f "go.mod" ]; then
         PROJECT_NAME=$(basename "$(pwd)")
-        VOLUME_ARGS+=("-v" "$(pwd):/source/${PROJECT_NAME}:ro,z")
+        VOLUME_ARGS+=("-v" "$(pwd):/source/${PROJECT_NAME}:ro")
         echo -e "${GREEN}Mounting current directory as /source/${PROJECT_NAME}${NC}"
     else
         echo -e "${YELLOW}No project detected in current directory${NC}"
@@ -135,7 +135,7 @@ else
     for src in "${SOURCE_MOUNTS[@]}"; do
         if [ -d "$src" ]; then
             PROJECT_NAME=$(basename "$src")
-            VOLUME_ARGS+=("-v" "$(realpath "$src"):/source/${PROJECT_NAME}:ro,z")
+            VOLUME_ARGS+=("-v" "$(realpath "$src"):/source/${PROJECT_NAME}:ro")
             echo -e "${GREEN}Mounting $src as /source/${PROJECT_NAME}${NC}"
         else
             echo -e "${RED}Warning: $src does not exist, skipping${NC}" >&2
@@ -153,14 +153,42 @@ fi
 # Run the container
 echo -e "${GREEN}Starting agent development container...${NC}"
 
-exec podman run \
-    ${DETACH} \
-    -it \
-    --rm \
-    --name "$CONTAINER_NAME" \
-    --security-opt label=disable \
-    --userns=keep-id \
-    --hostname agent-dev \
-    "${VOLUME_ARGS[@]}" \
-    "$IMAGE_NAME" \
-    "$@"
+# Check if yolo user exists for isolated execution
+if id "yolo" &>/dev/null; then
+    # Run as isolated yolo user (recommended for security)
+    echo -e "${GREEN}Running as isolated 'yolo' user${NC}"
+    exec sudo -u yolo podman run \
+        ${DETACH} \
+        -it \
+        --rm \
+        --name "$CONTAINER_NAME" \
+        --user root \
+        --security-opt label=disable \
+        --cap-add=CAP_SETUID \
+        --cap-add=CAP_SETGID \
+        --cap-add=CAP_SYS_ADMIN \
+        --device /dev/fuse \
+        --hostname agent-dev \
+        "${VOLUME_ARGS[@]}" \
+        "$IMAGE_NAME" \
+        "$@"
+else
+    # Fallback: run as current user (less secure - escape lands as your user)
+    echo -e "${YELLOW}Warning: 'yolo' user not found. Running as current user.${NC}"
+    echo -e "${YELLOW}For better isolation, create yolo user (see docs/SECURITY.md)${NC}"
+    exec podman run \
+        ${DETACH} \
+        -it \
+        --rm \
+        --name "$CONTAINER_NAME" \
+        --user root \
+        --security-opt label=disable \
+        --cap-add=CAP_SETUID \
+        --cap-add=CAP_SETGID \
+        --cap-add=CAP_SYS_ADMIN \
+        --device /dev/fuse \
+        --hostname agent-dev \
+        "${VOLUME_ARGS[@]}" \
+        "$IMAGE_NAME" \
+        "$@"
+fi

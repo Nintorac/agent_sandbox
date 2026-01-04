@@ -116,18 +116,48 @@ size:
 	@podman history --format "{{.Size}}\t{{.CreatedBy}}" $(IMAGE_NAME):$(IMAGE_TAG) | head -20
 
 # =============================================================================
+# Image Sharing
+# =============================================================================
+
+## sync-image: Copy agent-dev image from current user to yolo user
+sync-image:
+	@echo "Exporting $(IMAGE_NAME):$(IMAGE_TAG) from current user..."
+	podman save $(IMAGE_NAME):$(IMAGE_TAG) | sudo -u yolo podman load
+	@echo "Image synced to yolo user."
+
+# =============================================================================
 # Testing
 # =============================================================================
 
 ## test-smoke: Run smoke tests to validate all tools are installed correctly
 test-smoke:
-	podman run --rm \
-		--security-opt label=disable \
-		--userns=keep-id \
-		-v agent-home:/home/agent/.local/share/containers \
-		-v $(CURDIR)/tests:/tests:ro,z \
-		$(IMAGE_NAME):$(IMAGE_TAG) \
-		bash /tests/smoke_test.sh
+	@if id "yolo" &>/dev/null; then \
+		echo "Running smoke tests as yolo user..."; \
+		sudo -u yolo podman run --rm \
+			--user root \
+			--security-opt label=disable \
+			--cap-add=CAP_SETUID \
+			--cap-add=CAP_SETGID \
+			--cap-add=CAP_SYS_ADMIN \
+			--device /dev/fuse \
+			-v yolo-agent-storage:/home/agent/.local/share/containers \
+			-v $(CURDIR)/tests:/tests:ro,z \
+			$(IMAGE_NAME):$(IMAGE_TAG) \
+			bash /tests/smoke_test.sh; \
+	else \
+		echo "Warning: yolo user not found, running as current user"; \
+		podman run --rm \
+			--user root \
+			--security-opt label=disable \
+			--cap-add=CAP_SETUID \
+			--cap-add=CAP_SETGID \
+			--cap-add=CAP_SYS_ADMIN \
+			--device /dev/fuse \
+			-v agent-podman-storage:/home/agent/.local/share/containers \
+			-v $(CURDIR)/tests:/tests:ro,z \
+			$(IMAGE_NAME):$(IMAGE_TAG) \
+			bash /tests/smoke_test.sh; \
+	fi
 
 # =============================================================================
 # Subtree Management
