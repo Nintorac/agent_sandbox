@@ -139,6 +139,24 @@ If upstream changed their build approach, update the corresponding builder stage
 
 Build with parallel stages: `podman build --jobs=0 -t agent-dev .`
 
+### Security Hardening
+
+The container runs with **minimal privileges** to protect the host:
+
+- **No `--privileged`** - kernel modules, host devices inaccessible
+- **Native overlay filesystem** - no FUSE, no `CAP_SYS_ADMIN` needed
+- **User namespace isolation** (`--userns=keep-id`)
+- **SELinux label passthrough** (`label=disable` for mount compatibility only)
+
+**Do not add `--privileged`** to `run.sh` unless absolutely necessary. The current configuration supports nested containers without it.
+
+If nested podman fails after changes:
+1. Check host kernel version (must be 5.13+): `uname -r`
+2. Reset storage: `podman system reset` (inside container)
+3. Verify storage driver: `podman info | grep graphDriverName`
+
+See [Security Model](README.md#security-model) for full details.
+
 ### Making Local Modifications
 
 You can edit files in `vendor/` directly. Commit changes normally:

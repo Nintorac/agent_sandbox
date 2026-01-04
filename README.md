@@ -302,15 +302,62 @@ See [AGENTS.md](./AGENTS.md) for detailed subtree management instructions.
 | `entrypoint.sh` | Container initialization |
 | `run.sh` | Helper script for launching |
 
+## Security Model
+
+This container is hardened for AI agents running in autonomous mode (YOLO mode).
+
+### Host Protection
+
+| Protection | Status |
+|------------|--------|
+| No `--privileged` flag | Container cannot access host devices or load kernel modules |
+| No `/dev/fuse` exposure | Uses kernel-native overlay (requires host kernel 5.13+) |
+| No `unmask=ALL` | Sensitive `/proc` and `/sys` paths remain masked |
+| Read-only source mounts | Agent cannot modify your original code (`:ro` flag) |
+| User namespace isolation | Container UID maps to your host UID |
+
+### What the Container CAN Do
+
+- Run nested containers (podman-in-podman) via native overlay
+- Access network (for package managers, APIs)
+- Write to `/workspace` volume
+- Execute arbitrary code within the container
+
+### What the Container CANNOT Do
+
+- Access host filesystem outside mounted volumes
+- Load kernel modules
+- Read `/proc/kcore` (host memory)
+- Access `/proc/keys` (cryptographic keys)
+- Modify cgroups or escape to host namespace
+- See or access host devices
+
+### Requirements
+
+- **Host kernel 5.13+** for native overlay in user namespaces
+- Podman with rootless support
+
+Check your kernel version: `uname -r`
+
 ## Troubleshooting
 
 ### Nested containers not working
 
-Ensure the container is running with proper flags:
+1. **Check kernel version** - must be 5.13+ for native overlay:
+   ```bash
+   uname -r
+   ```
 
-```bash
-podman run --privileged --device=/dev/fuse --security-opt label=disable ...
-```
+2. **Reset podman storage** if switching from fuse-overlayfs:
+   ```bash
+   # Inside container
+   podman system reset
+   ```
+
+3. **Verify overlay driver**:
+   ```bash
+   podman info | grep -A2 graphDriverName
+   ```
 
 ### Permission issues
 

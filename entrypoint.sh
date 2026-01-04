@@ -109,7 +109,7 @@ check_podman() {
         log_success "Podman is available (nested containers supported)"
     else
         log_warn "Podman not fully available - nested containers may not work"
-        log_info "Ensure container is running with --privileged flag"
+        log_info "Host kernel 5.13+ required for native overlay. Try: podman system reset"
     fi
 }
 

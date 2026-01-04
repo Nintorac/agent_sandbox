@@ -122,6 +122,9 @@ size:
 ## test-smoke: Run smoke tests to validate all tools are installed correctly
 test-smoke:
 	podman run --rm \
+		--security-opt label=disable \
+		--userns=keep-id \
+		-v agent-home:/home/agent/.local/share/containers \
 		-v $(CURDIR)/tests:/tests:ro,z \
 		$(IMAGE_NAME):$(IMAGE_TAG) \
 		bash /tests/smoke_test.sh

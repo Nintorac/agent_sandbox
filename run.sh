@@ -158,10 +158,7 @@ exec podman run \
     -it \
     --rm \
     --name "$CONTAINER_NAME" \
-    --privileged \
-    --device=/dev/fuse \
     --security-opt label=disable \
-    --security-opt unmask=ALL \
     --userns=keep-id \
     --hostname agent-dev \
     "${VOLUME_ARGS[@]}" \

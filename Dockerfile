@@ -240,6 +240,7 @@ RUN useradd -m -s /usr/bin/zsh agent \
 # Configure podman for nested containers
 COPY containers.conf /etc/containers/containers.conf
 COPY storage.conf /etc/containers/storage.conf
+RUN chmod 644 /etc/containers/containers.conf /etc/containers/storage.conf
 
 # Create rootless storage directories
 RUN mkdir -p /home/agent/.local/share/containers/storage \

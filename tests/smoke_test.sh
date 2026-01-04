@@ -76,10 +76,15 @@ check_tool "bat" "bat --version"
 check_tool "eza" "eza --version"
 echo ""
 
-echo "Container Tools (path check only - needs privileges to run):"
-check_tool "podman" "command -v podman"
-check_tool "buildah" "command -v buildah"
+echo "Container Tools:"
+check_tool "podman" "podman --version"
+check_tool "buildah" "buildah --version"
 check_tool "skopeo" "skopeo --version"
+echo ""
+
+echo "Podman-in-Podman (nested containers):"
+check_tool "podman-info" "podman info --format '{{.Host.OCIRuntime.Name}}'"
+check_tool "podman-run" "podman run --rm alpine:latest echo nested-container-works"
 echo ""
 
 echo "System Tools:"
