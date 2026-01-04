@@ -1,7 +1,7 @@
 # Agent Development Container Makefile
 # Build with parallel stages: make build
 
-.PHONY: build build-parallel build-nocache run run-build shell clean reset help
+.PHONY: build build-parallel build-nocache run run-build shell clean reset help test-smoke
 
 # Configuration
 IMAGE_NAME ?= agent-dev
@@ -116,6 +116,17 @@ size:
 	@podman history --format "{{.Size}}\t{{.CreatedBy}}" $(IMAGE_NAME):$(IMAGE_TAG) | head -20
 
 # =============================================================================
+# Testing
+# =============================================================================
+
+## test-smoke: Run smoke tests to validate all tools are installed correctly
+test-smoke:
+	podman run --rm \
+		-v $(CURDIR)/tests:/tests:ro,z \
+		$(IMAGE_NAME):$(IMAGE_TAG) \
+		bash /tests/smoke_test.sh
+
+# =============================================================================
 # Subtree Management
 # =============================================================================
 
@@ -141,7 +152,7 @@ help:
 	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(build|Build)' | sed 's/## /  /' | sed 's/: /\t/'
 	@echo ""
 	@echo "Run targets:"
-	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(run|Run|shell)' | sed 's/## /  /' | sed 's/: /\t/'
+	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(run|Run|shell)' | grep -v 'test' | sed 's/## /  /' | sed 's/: /\t/'
 	@echo ""
 	@echo "Volume management:"
 	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(volume|reset|Volume)' | sed 's/## /  /' | sed 's/: /\t/'
@@ -151,6 +162,9 @@ help:
 	@echo ""
 	@echo "Development:"
 	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(lint|inspect|history|size|subtree)' | sed 's/## /  /' | sed 's/: /\t/'
+	@echo ""
+	@echo "Testing:"
+	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(test)' | sed 's/## /  /' | sed 's/: /\t/'
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build          # Build with parallel stages"

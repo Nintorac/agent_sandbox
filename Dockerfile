@@ -46,13 +46,14 @@ RUN cd /build/beads_viewer \
         -o /out/bv ./cmd/bv
 
 # --- Build gastown (requires CGO per .goreleaser.yml) ---
+# Uses static linking to avoid musl/glibc mismatch with Fedora runtime
 COPY vendor/gastown /build/gastown
 ARG GT_VERSION=dev
 ARG GT_COMMIT=unknown
 RUN cd /build/gastown \
     && go mod download \
     && CGO_ENABLED=1 go build \
-        -ldflags="-s -w \
+        -ldflags="-s -w -linkmode external -extldflags '-static' \
             -X github.com/steveyegge/gastown/internal/cmd.Version=${GT_VERSION} \
             -X github.com/steveyegge/gastown/internal/cmd.Commit=${GT_COMMIT}" \
         -o /out/gt ./cmd/gt
