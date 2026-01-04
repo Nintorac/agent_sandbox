@@ -202,40 +202,8 @@ RUN rm -rf /opt/vendor/*/target \
 ARG OHMYZSH_COMMIT
 RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/${OHMYZSH_COMMIT}/tools/install.sh)" "" --unattended
 
-# Configure zsh with plugins and starship
-RUN cat > ~/.zshrc << 'EOF'
-# Path configuration
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
-
-# Oh-My-Zsh configuration
-export ZSH="$HOME/.oh-my-zsh"
-ZSH_THEME=""  # Using starship instead
-plugins=(git fzf zoxide)
-source $ZSH/oh-my-zsh.sh
-
-# Initialize tools
-eval "$(starship init zsh)"
-eval "$(zoxide init zsh)"
-eval "$(atuin init zsh)"
-
-# Aliases using modern tools
-alias ls='lsd'
-alias ll='lsd -la'
-alias lt='lsd --tree'
-alias cat='bat --paging=never'
-
-# Agent environment
-export WORKSPACE="/workspace"
-export SOURCE="/source"
-
-# Gastown environment
-export GT_HOME="$WORKSPACE/gt"
-
-# Container detection
-if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
-    export CONTAINER_ENV=1
-fi
-EOF
+# Copy zsh configuration (includes velocity aliases for cc, cod, gmi)
+COPY --chown=agent:agent zshrc /home/agent/.zshrc
 
 # Configure starship prompt
 RUN mkdir -p ~/.config && cat > ~/.config/starship.toml << 'EOF'
