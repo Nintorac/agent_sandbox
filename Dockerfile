@@ -1,7 +1,158 @@
 # Agent Development Container
 # Fedora-based container with podman-in-podman support for AI agent workflows
 # Inspired by agent-flywheel.com
+#
+# Build with parallel stages: podman build --jobs=0 -t agent-dev .
 
+# =============================================================================
+# Builder Stage 1: Go Tools
+# Based on vendor/ntm/Dockerfile approach (golang:1.25-alpine)
+# =============================================================================
+FROM golang:1.25-alpine AS go-builder
+
+WORKDIR /build
+
+# Install build dependencies (matches ntm Dockerfile)
+RUN apk add --no-cache git ca-certificates tzdata gcc musl-dev
+
+# GOTOOLCHAIN=auto downloads exact Go version if go.mod requires it
+ENV GOTOOLCHAIN=auto
+ENV GOSUMDB=sum.golang.org
+
+# Create output directory
+RUN mkdir -p /out
+
+# --- Build ntm (matches vendor/ntm/Dockerfile) ---
+COPY vendor/ntm /build/ntm
+ARG NTM_VERSION=dev
+ARG NTM_COMMIT=unknown
+RUN cd /build/ntm \
+    && go mod download \
+    && CGO_ENABLED=0 GOOS=linux go build \
+        -trimpath \
+        -ldflags="-s -w \
+            -X github.com/Dicklesworthstone/ntm/internal/cli.Version=${NTM_VERSION} \
+            -X github.com/Dicklesworthstone/ntm/internal/cli.Commit=${NTM_COMMIT} \
+            -X github.com/Dicklesworthstone/ntm/internal/cli.BuiltBy=docker" \
+        -o /out/ntm ./cmd/ntm
+
+# --- Build beads_viewer (no official Dockerfile, simple build) ---
+COPY vendor/beads_viewer /build/beads_viewer
+RUN cd /build/beads_viewer \
+    && go mod download \
+    && CGO_ENABLED=0 GOOS=linux go build \
+        -trimpath \
+        -ldflags="-s -w" \
+        -o /out/bv ./cmd/bv
+
+# --- Build gastown (requires CGO per .goreleaser.yml) ---
+COPY vendor/gastown /build/gastown
+ARG GT_VERSION=dev
+ARG GT_COMMIT=unknown
+RUN cd /build/gastown \
+    && go mod download \
+    && CGO_ENABLED=1 go build \
+        -ldflags="-s -w \
+            -X github.com/steveyegge/gastown/internal/cmd.Version=${GT_VERSION} \
+            -X github.com/steveyegge/gastown/internal/cmd.Commit=${GT_COMMIT}" \
+        -o /out/gt ./cmd/gt
+
+# --- Build caam (no official Dockerfile, simple build) ---
+COPY vendor/coding_agent_account_manager /build/caam
+RUN cd /build/caam \
+    && go mod download \
+    && CGO_ENABLED=0 GOOS=linux go build \
+        -trimpath \
+        -ldflags="-s -w" \
+        -o /out/caam ./cmd/caam
+
+# --- Build slb (no official Dockerfile, simple build) ---
+COPY vendor/simultaneous_launch_button /build/slb
+RUN cd /build/slb \
+    && go mod download \
+    && CGO_ENABLED=0 GOOS=linux go build \
+        -trimpath \
+        -ldflags="-s -w" \
+        -o /out/slb ./cmd/slb
+
+# =============================================================================
+# Builder Stage 2: Rust Tool (CASS)
+# coding_agent_session_search uses edition = "2024" (requires nightly)
+# Profile: lto=true, codegen-units=1, strip=true, panic="abort", opt-level="z"
+# Dependencies: onig_sys, ring, libsqlite3-sys, zstd-sys, fastembed/onnxruntime
+# =============================================================================
+FROM rust:slim AS rust-builder
+
+# Install build dependencies including C++ toolchain for native deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    build-essential \
+    g++ \
+    libstdc++-12-dev \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install nightly toolchain (required for Rust 2024 edition)
+RUN rustup default nightly
+
+WORKDIR /build
+COPY vendor/coding_agent_session_search .
+
+# Build with release profile (Cargo.toml already has aggressive optimizations)
+RUN mkdir -p /out \
+    && cargo build --release \
+    && cp target/release/cass /out/cass
+
+# =============================================================================
+# Builder Stage 3: Node Tool (cass_memory_system)
+# Uses Bun to compile to standalone binary
+# =============================================================================
+FROM oven/bun:latest AS node-builder
+
+WORKDIR /build
+COPY vendor/cass_memory_system .
+
+# Build standalone binary (matches package.json build:current script)
+RUN bun install \
+    && bun build src/cm.ts --compile --outfile dist/cass-memory \
+    && mkdir -p /out \
+    && cp dist/cass-memory /out/cm
+
+# =============================================================================
+# Builder Stage 4: Python Tool (mcp_agent_mail)
+# Based on vendor/mcp_agent_mail/Dockerfile
+# =============================================================================
+FROM python:3.14-slim AS python-builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_SYSTEM_PYTHON=1 \
+    PATH="/root/.local/bin:${PATH}"
+
+# Install dependencies (matches vendor Dockerfile)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+WORKDIR /app
+
+# Copy project metadata first for better caching (matches vendor Dockerfile)
+COPY vendor/mcp_agent_mail/pyproject.toml vendor/mcp_agent_mail/README.md ./
+
+# Install runtime deps
+RUN uv sync --no-dev
+
+# Copy source
+COPY vendor/mcp_agent_mail/src ./src
+
+# =============================================================================
+# Final Stage: Fedora Runtime
+# =============================================================================
 FROM fedora:41
 
 # Build arguments
@@ -10,9 +161,9 @@ ARG OHMYZSH_COMMIT=a79b37b95461ea2be32578957473375954ab31ff
 LABEL maintainer="agent-dev"
 LABEL description="AI Agent Development Environment with podman-in-podman support"
 
-# =============================================================================
-# Stage 1: Base System & Podman Setup
-# =============================================================================
+# -----------------------------------------------------------------------------
+# System Packages & Podman Setup
+# -----------------------------------------------------------------------------
 
 # Install system packages including podman and container tools
 RUN dnf install -y \
@@ -59,9 +210,9 @@ RUN dnf install -y \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 
-# =============================================================================
-# Stage 2: Language Runtimes
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Language Runtimes
+# -----------------------------------------------------------------------------
 
 # Node.js 22 LTS (via NodeSource)
 RUN curl -fsSL https://rpm.nodesource.com/setup_22.x | bash - \
@@ -69,18 +220,13 @@ RUN curl -fsSL https://rpm.nodesource.com/setup_22.x | bash - \
     && dnf clean all \
     && npm install -g npm@latest
 
-# Python via uv (installed later as agent user)
-
-# Go 1.23
+# Go (for any runtime needs - vendor tools are pre-built)
 RUN dnf install -y golang \
     && dnf clean all
 
-# Rust (via rustup for the agent user - installed later)
-# Bun (installed later as agent user)
-
-# =============================================================================
-# Stage 3: Create Agent User with subuid/subgid for rootless podman
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Create Agent User with subuid/subgid for rootless podman
+# -----------------------------------------------------------------------------
 
 RUN useradd -m -s /usr/bin/zsh agent \
     && echo "agent:100000:65536" >> /etc/subuid \
@@ -98,9 +244,33 @@ COPY storage.conf /etc/containers/storage.conf
 RUN mkdir -p /home/agent/.local/share/containers/storage \
     && chown -R agent:agent /home/agent/.local/share
 
-# =============================================================================
-# Stage 4: Install Rust & Cargo Tools (as agent user)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Copy Pre-built Vendor Tools from Builder Stages
+# -----------------------------------------------------------------------------
+
+# Go tools (ntm, bv, gt, caam, slb)
+COPY --from=go-builder --chown=agent:agent /out/ntm /home/agent/.local/bin/ntm
+COPY --from=go-builder --chown=agent:agent /out/bv /home/agent/.local/bin/bv
+COPY --from=go-builder --chown=agent:agent /out/gt /home/agent/.local/bin/gt
+COPY --from=go-builder --chown=agent:agent /out/caam /home/agent/.local/bin/caam
+COPY --from=go-builder --chown=agent:agent /out/slb /home/agent/.local/bin/slb
+
+# Rust tool (cass)
+COPY --from=rust-builder --chown=agent:agent /out/cass /home/agent/.local/bin/cass
+
+# Node tool (cm - cass_memory_system compiled binary)
+COPY --from=node-builder --chown=agent:agent /out/cm /home/agent/.local/bin/cm
+
+# Python tool (mcp_agent_mail) - copy entire app with venv
+COPY --from=python-builder --chown=agent:agent /app /opt/mcp_agent_mail
+
+# UBS - bash script, just copy directly (matches vendor/ultimate_bug_scanner/Dockerfile approach)
+COPY --chown=agent:agent vendor/ultimate_bug_scanner/ubs /home/agent/.local/bin/ubs
+RUN chmod +x /home/agent/.local/bin/ubs
+
+# -----------------------------------------------------------------------------
+# Install Rust & Cargo CLI Tools (as agent user)
+# -----------------------------------------------------------------------------
 
 USER agent
 WORKDIR /home/agent
@@ -131,14 +301,14 @@ RUN . "$HOME/.cargo/env" && \
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/home/agent/.bun/bin:${PATH}"
 
-# Install uv and Python
+# Install uv and Python (3.12 for general use, 3.14 available via mcp_agent_mail venv)
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/home/agent/.local/bin:${PATH}"
 RUN uv python install 3.12
 
-# =============================================================================
-# Stage 5: Install AI Agent CLIs
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Install AI Agent CLIs
+# -----------------------------------------------------------------------------
 
 # Configure npm for user-local global installs
 RUN mkdir -p /home/agent/.npm-global \
@@ -150,53 +320,9 @@ RUN npm install -g @anthropic-ai/claude-code \
     && npm install -g @openai/codex \
     && npm install -g @google/gemini-cli
 
-# =============================================================================
-# Stage 6: Build & Install Flywheel Tools from vendor/
-# =============================================================================
-
-# Copy vendor directory
-USER root
-COPY --chown=agent:agent vendor /opt/vendor
-USER agent
-
-# Build Go tools (ntm, beads_viewer, gastown, caam, slb)
-# GOTOOLCHAIN=auto downloads required Go version if needed
-ENV GOTOOLCHAIN=auto
-ENV GOSUMDB=sum.golang.org
-RUN cd /opt/vendor/ntm && go build -o /home/agent/.local/bin/ntm ./cmd/ntm \
-    && cd /opt/vendor/beads_viewer && go build -o /home/agent/.local/bin/bv ./cmd/bv \
-    && cd /opt/vendor/gastown && go build -o /home/agent/.local/bin/gt ./cmd/gt \
-    && cd /opt/vendor/coding_agent_account_manager && go build -o /home/agent/.local/bin/caam ./cmd/caam \
-    && cd /opt/vendor/simultaneous_launch_button && go build -o /home/agent/.local/bin/slb ./cmd/slb
-
-# Build Rust tool (coding_agent_session_search / cass)
-RUN cd /opt/vendor/coding_agent_session_search \
-    && . "$HOME/.cargo/env" \
-    && cargo build --release \
-    && cp target/release/cass /home/agent/.local/bin/cass
-
-# Install UBS (bash script)
-RUN cp /opt/vendor/ultimate_bug_scanner/ubs /home/agent/.local/bin/ubs \
-    && chmod +x /home/agent/.local/bin/ubs
-
-# Install mcp_agent_mail as MCP server (library, not CLI)
-# Requires Python 3.14
-RUN uv python install 3.14 \
-    && uv venv --python 3.14 /home/agent/.venv-mcp \
-    && VIRTUAL_ENV=/home/agent/.venv-mcp uv pip install /opt/vendor/mcp_agent_mail
-
-# Install Node.js tool (cass_memory_system)
-RUN cd /opt/vendor/cass_memory_system && npm install && npm link
-
-# Cleanup build artifacts to reduce image size
-RUN rm -rf /opt/vendor/*/target \
-    && rm -rf /opt/vendor/*/.git \
-    && rm -rf /home/agent/.cargo/registry \
-    && rm -rf /home/agent/.cargo/git
-
-# =============================================================================
-# Stage 7: Shell Configuration
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Shell Configuration
+# -----------------------------------------------------------------------------
 
 # Install oh-my-zsh at pinned commit
 ARG OHMYZSH_COMMIT
@@ -228,9 +354,13 @@ success_symbol = "[>](bold green)"
 error_symbol = "[>](bold red)"
 EOF
 
-# =============================================================================
-# Stage 8: Create workspace directories
-# =============================================================================
+# Cleanup cargo build cache to reduce image size
+RUN rm -rf /home/agent/.cargo/registry \
+    && rm -rf /home/agent/.cargo/git
+
+# -----------------------------------------------------------------------------
+# Create Workspace Directories
+# -----------------------------------------------------------------------------
 
 USER root
 
@@ -243,9 +373,9 @@ RUN mkdir -p /source /workspace \
 VOLUME /home/agent/.local/share/containers
 VOLUME /workspace
 
-# =============================================================================
-# Stage 9: Entrypoint
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------------------------
 
 COPY --chown=agent:agent entrypoint.sh /home/agent/entrypoint.sh
 RUN chmod +x /home/agent/entrypoint.sh

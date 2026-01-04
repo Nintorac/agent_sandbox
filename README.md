@@ -13,8 +13,8 @@ A Fedora-based development container for AI agent workflows with podman-in-podma
 ## Quick Start
 
 ```bash
-# Build the container
-podman build -t agent-dev .
+# Build the container (with parallel stages)
+make build
 
 # Run with your project mounted
 cd /path/to/your/project
@@ -25,7 +25,8 @@ Or use the run script with options:
 
 ```bash
 # Build and run in one command
-./run.sh --build
+make run-build
+# or: ./run.sh --build
 
 # Mount a specific project
 ./run.sh -s ~/projects/myapp
@@ -33,6 +34,18 @@ Or use the run script with options:
 # Mount multiple projects
 ./run.sh -s ~/projects/frontend -s ~/projects/backend
 ```
+
+### Makefile Targets
+
+| Target | Description |
+|--------|-------------|
+| `make build` | Build with parallel stages (recommended) |
+| `make build-nocache` | Full rebuild without cache |
+| `make run` | Run the container |
+| `make run-build` | Build and run |
+| `make clean` | Remove build cache |
+| `make reset` | Remove workspace volume (destroys agent work) |
+| `make help` | Show all available targets |
 
 ## The Source/Workspace Workflow
 
@@ -215,8 +228,10 @@ git subtree pull --prefix=vendor/ntm \
     https://github.com/Dicklesworthstone/ntm.git v1.4.0 --squash
 
 # Rebuild container
-./run.sh --build
+make build
 ```
+
+> **Important:** When updating subtrees, verify the Dockerfile builder stages still align with upstream. See [AGENTS.md](./AGENTS.md#dockerfile-alignment) for the checklist.
 
 ### Making Local Changes
 
@@ -280,7 +295,8 @@ See [AGENTS.md](./AGENTS.md) for detailed subtree management instructions.
 
 | File | Description |
 |------|-------------|
-| `Dockerfile` | Container image definition |
+| `Dockerfile` | Multi-stage container image definition |
+| `Makefile` | Build automation (run `make help` for targets) |
 | `containers.conf` | Podman configuration |
 | `storage.conf` | Container storage configuration |
 | `entrypoint.sh` | Container initialization |

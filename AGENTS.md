@@ -120,6 +120,25 @@ After updating, rebuild the container to incorporate changes:
 ./run.sh --build
 ```
 
+### Dockerfile Alignment
+
+When updating subtrees, verify the Dockerfile build stage still aligns with upstream:
+
+1. Check if the vendor tool's Dockerfile or build approach changed
+2. Check if `go.mod` / `Cargo.toml` / `pyproject.toml` version requirements changed
+3. Check if build flags or dependencies changed (e.g., CGO requirements)
+
+If upstream changed their build approach, update the corresponding builder stage in our Dockerfile. The multi-stage build uses:
+
+| Builder Stage | Base Image | Tools |
+|---------------|-----------|-------|
+| `go-builder` | golang:1.25-alpine | ntm, bv, gt, caam, slb |
+| `rust-builder` | rust:slim + nightly | cass |
+| `node-builder` | oven/bun:latest | cm (cass_memory_system) |
+| `python-builder` | python:3.14-slim | mcp_agent_mail |
+
+Build with parallel stages: `podman build --jobs=0 -t agent-dev .`
+
 ### Making Local Modifications
 
 You can edit files in `vendor/` directly. Commit changes normally:
@@ -155,9 +174,27 @@ Then update the Dockerfile to build/install the new tool.
 
 ## Build Commands
 
+Use the Makefile for common operations:
+
 ```bash
-# Build the container
-podman build -t agent-dev .
+# Build with parallel stages (recommended)
+make build
+
+# Build and run
+make run-build
+
+# Build without cache (full rebuild)
+make build-nocache
+
+# Show all available targets
+make help
+```
+
+Or use the scripts directly:
+
+```bash
+# Build the container with parallel stages
+podman build --jobs=0 -t agent-dev .
 
 # Build and run
 ./run.sh --build
@@ -168,6 +205,18 @@ podman build -t agent-dev .
 # Reset workspace (destroys agent work)
 ./run.sh --reset
 ```
+
+### Makefile Targets
+
+| Target | Description |
+|--------|-------------|
+| `make build` | Build with parallel stages (recommended) |
+| `make build-nocache` | Full rebuild without cache |
+| `make run` | Run the container |
+| `make run-build` | Build and run |
+| `make clean` | Remove build cache |
+| `make reset` | Remove workspace volume |
+| `make help` | Show all targets |
 
 ---
 
