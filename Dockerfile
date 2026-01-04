@@ -42,6 +42,7 @@ RUN dnf install -y \
     fzf \
     # Development tools
     make \
+    cmake \
     gcc \
     gcc-c++ \
     openssl-devel \
@@ -62,19 +63,13 @@ RUN dnf install -y \
 # Stage 2: Language Runtimes
 # =============================================================================
 
-# Node.js 22 LTS
-RUN dnf module install -y nodejs:22/common \
+# Node.js 22 LTS (via NodeSource)
+RUN curl -fsSL https://rpm.nodesource.com/setup_22.x | bash - \
+    && dnf install -y nodejs \
     && dnf clean all \
     && npm install -g npm@latest
 
-# Python 3.12
-RUN dnf install -y \
-    python3.12 \
-    python3.12-pip \
-    python3.12-devel \
-    && dnf clean all \
-    && alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
-    && alternatives --install /usr/bin/pip pip /usr/bin/pip3.12 1
+# Python via uv (installed later as agent user)
 
 # Go 1.23
 RUN dnf install -y golang \
@@ -101,7 +96,7 @@ COPY storage.conf /etc/containers/storage.conf
 
 # Create rootless storage directories
 RUN mkdir -p /home/agent/.local/share/containers/storage \
-    && chown -R agent:agent /home/agent/.local/share/containers
+    && chown -R agent:agent /home/agent/.local/share
 
 # =============================================================================
 # Stage 4: Install Rust & Cargo Tools (as agent user)
@@ -117,22 +112,38 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 # Add cargo to PATH for subsequent commands
 ENV PATH="/home/agent/.cargo/bin:${PATH}"
 
-# Install CLI utilities via cargo
+# Install CLI utilities via cargo (pinned versions)
+ARG LSD_VERSION=1.1.5
+ARG ZOXIDE_VERSION=0.9.6
+ARG ATUIN_VERSION=18.4.0
+ARG STARSHIP_VERSION=1.21.1
+ARG BAT_VERSION=0.24.0
+ARG EZA_VERSION=0.20.14
 RUN . "$HOME/.cargo/env" && \
-    cargo install lsd && \
-    cargo install zoxide --locked && \
-    cargo install atuin && \
-    cargo install starship --locked && \
-    cargo install bat && \
-    cargo install eza
+    cargo install lsd --version ${LSD_VERSION} --locked && \
+    cargo install zoxide --version ${ZOXIDE_VERSION} --locked && \
+    cargo install atuin --version ${ATUIN_VERSION} --locked && \
+    cargo install starship --version ${STARSHIP_VERSION} --locked && \
+    cargo install bat --version ${BAT_VERSION} --locked && \
+    cargo install eza --version ${EZA_VERSION} --locked
 
 # Install Bun
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/home/agent/.bun/bin:${PATH}"
 
+# Install uv and Python
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/home/agent/.local/bin:${PATH}"
+RUN uv python install 3.12
+
 # =============================================================================
 # Stage 5: Install AI Agent CLIs
 # =============================================================================
+
+# Configure npm for user-local global installs
+RUN mkdir -p /home/agent/.npm-global \
+    && npm config set prefix '/home/agent/.npm-global'
+ENV PATH="/home/agent/.npm-global/bin:${PATH}"
 
 # Install Claude Code, Codex CLI, Gemini CLI
 RUN npm install -g @anthropic-ai/claude-code \
@@ -149,11 +160,14 @@ COPY --chown=agent:agent vendor /opt/vendor
 USER agent
 
 # Build Go tools (ntm, beads_viewer, gastown, caam, slb)
-RUN cd /opt/vendor/ntm && go build -o /home/agent/.local/bin/ntm . \
+# GOTOOLCHAIN=auto downloads required Go version if needed
+ENV GOTOOLCHAIN=auto
+ENV GOSUMDB=sum.golang.org
+RUN cd /opt/vendor/ntm && go build -o /home/agent/.local/bin/ntm ./cmd/ntm \
     && cd /opt/vendor/beads_viewer && go build -o /home/agent/.local/bin/bv ./cmd/bv \
     && cd /opt/vendor/gastown && go build -o /home/agent/.local/bin/gt ./cmd/gt \
-    && cd /opt/vendor/coding_agent_account_manager && go build -o /home/agent/.local/bin/caam . \
-    && cd /opt/vendor/simultaneous_launch_button && go build -o /home/agent/.local/bin/slb .
+    && cd /opt/vendor/coding_agent_account_manager && go build -o /home/agent/.local/bin/caam ./cmd/caam \
+    && cd /opt/vendor/simultaneous_launch_button && go build -o /home/agent/.local/bin/slb ./cmd/slb
 
 # Build Rust tool (coding_agent_session_search / cass)
 RUN cd /opt/vendor/coding_agent_session_search \
@@ -161,9 +175,15 @@ RUN cd /opt/vendor/coding_agent_session_search \
     && cargo build --release \
     && cp target/release/cass /home/agent/.local/bin/cass
 
-# Install Python tools (ultimate_bug_scanner, mcp_agent_mail)
-RUN pip install --user /opt/vendor/ultimate_bug_scanner \
-    && pip install --user /opt/vendor/mcp_agent_mail
+# Install UBS (bash script)
+RUN cp /opt/vendor/ultimate_bug_scanner/ubs /home/agent/.local/bin/ubs \
+    && chmod +x /home/agent/.local/bin/ubs
+
+# Install mcp_agent_mail as MCP server (library, not CLI)
+# Requires Python 3.14
+RUN uv python install 3.14 \
+    && uv venv --python 3.14 /home/agent/.venv-mcp \
+    && VIRTUAL_ENV=/home/agent/.venv-mcp uv pip install /opt/vendor/mcp_agent_mail
 
 # Install Node.js tool (cass_memory_system)
 RUN cd /opt/vendor/cass_memory_system && npm install && npm link
