@@ -156,6 +156,19 @@ else
 fi
 echo ""
 
+echo "Workspace Access:"
+printf "  %-20s " "workspace-writable"
+TEST_FILE="/workspace/.smoke-test-$$"
+if touch "$TEST_FILE" 2>/dev/null && rm -f "$TEST_FILE" 2>/dev/null; then
+    echo -e "${GREEN}PASS${NC}"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}FAIL${NC} (cannot write to /workspace)"
+    FAIL=$((FAIL + 1))
+    FAILED_TOOLS="$FAILED_TOOLS workspace-writable"
+fi
+echo ""
+
 echo "=========================================="
 echo "Results: ${GREEN}$PASS passed${NC}, ${RED}$FAIL failed${NC}"
 echo "=========================================="

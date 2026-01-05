@@ -54,7 +54,6 @@ make run-build
 | `make run-build` | Build and run |
 | `make test-smoke` | Run smoke tests (tools + security) |
 | `make clean` | Remove build cache |
-| `make reset` | Remove workspace volume (destroys agent work) |
 | `make help` | Show all available targets |
 
 ### Recommended Host Aliases
@@ -418,11 +417,10 @@ sudo ./setup-host.sh
 
 ### Permission issues
 
-If you see permission errors:
+If you see permission errors, check that the workspace directory on the host is owned by the yolo user:
 
 ```bash
-# Reset the workspace volume
-./run.sh --reset
+sudo chown -R yolo:yolo /workspace/agent_workspace
 ```
 
 ### Firewall not blocking internal network

@@ -7,7 +7,7 @@ set -e
 # Configuration
 IMAGE_NAME="${AGENT_DEV_IMAGE:-agent-dev:latest}"
 CONTAINER_NAME="${AGENT_DEV_NAME:-agent-dev}"
-WORKSPACE_VOLUME="${AGENT_DEV_WORKSPACE:-agent-workspace}"
+WORKSPACE_DIR="${AGENT_DEV_WORKSPACE:-/workspace/agent_workspace}"
 
 # Colors
 RED='\033[0;31m'
@@ -25,14 +25,14 @@ Options:
     -s, --source PATH    Mount additional source directory (can be used multiple times)
     -n, --name NAME      Container name (default: agent-dev)
     -d, --detach         Run in detached mode
-    -r, --reset          Reset workspace volume (destroys existing data)
+    -r, --replace        Replace existing container with same name
     -b, --build          Build the image before running
     -h, --help           Show this help message
 
 Environment Variables:
     AGENT_DEV_IMAGE      Image name (default: agent-dev:latest)
     AGENT_DEV_NAME       Container name (default: agent-dev)
-    AGENT_DEV_WORKSPACE  Workspace volume name (default: agent-workspace)
+    AGENT_DEV_WORKSPACE  Workspace directory path (default: /workspace/agent_workspace)
 
 Examples:
     # Run with current directory as source
@@ -57,7 +57,7 @@ EOF
 # Parse arguments
 SOURCE_MOUNTS=()
 DETACH=""
-RESET=""
+REPLACE=""
 BUILD=""
 
 while [[ $# -gt 0 ]]; do
@@ -74,8 +74,8 @@ while [[ $# -gt 0 ]]; do
             DETACH="-d"
             shift
             ;;
-        -r|--reset)
-            RESET="1"
+        -r|--replace)
+            REPLACE="--replace"
             shift
             ;;
         -b|--build)
@@ -104,20 +104,23 @@ if [ -n "$BUILD" ]; then
     echo -e "${GREEN}Building image...${NC}"
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     podman build -t "$IMAGE_NAME" "$SCRIPT_DIR"
+
+    # Sync to yolo user if it exists (they have separate podman storage)
+    if id "yolo" &>/dev/null; then
+        echo -e "${GREEN}Syncing image to yolo user...${NC}"
+        podman save "$IMAGE_NAME" | sudo -u yolo podman load
+    fi
 fi
 
-# Reset workspace if requested
-if [ -n "$RESET" ]; then
-    echo -e "${YELLOW}Resetting workspace volume...${NC}"
-    podman volume rm -f "$WORKSPACE_VOLUME" 2>/dev/null || true
-fi
+# Ensure workspace directory exists
+mkdir -p "$WORKSPACE_DIR"
 
 # Build volume mount arguments
 VOLUME_ARGS=(
     # Rootless podman storage (avoid overlay-on-overlay)
     "-v" "agent-home:/home/agent/.local/share/containers"
-    # Persistent workspace
-    "-v" "${WORKSPACE_VOLUME}:/workspace"
+    # Persistent workspace (bind mount from host)
+    "-v" "${WORKSPACE_DIR}:/workspace:Z"
 )
 
 # Add source mounts
@@ -161,6 +164,7 @@ if id "yolo" &>/dev/null; then
         ${DETACH} \
         -it \
         --rm \
+        ${REPLACE} \
         --name "$CONTAINER_NAME" \
         --user root \
         --security-opt label=disable \
@@ -180,6 +184,7 @@ else
         ${DETACH} \
         -it \
         --rm \
+        ${REPLACE} \
         --name "$CONTAINER_NAME" \
         --user root \
         --security-opt label=disable \

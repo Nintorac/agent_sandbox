@@ -1,13 +1,13 @@
 # Agent Development Container Makefile
 # Build with parallel stages: make build
 
-.PHONY: build build-parallel build-nocache run run-build shell clean reset help test-smoke
+.PHONY: build build-parallel build-nocache run run-build shell clean help test-smoke
 
 # Configuration
 IMAGE_NAME ?= agent-dev
 IMAGE_TAG ?= latest
 CONTAINER_NAME ?= agent-dev
-WORKSPACE_VOLUME ?= agent-workspace
+WORKSPACE_DIR ?= /workspace/agent_workspace
 PODMAN_STORAGE_VOLUME ?= agent-podman-storage
 
 # Default target
@@ -53,28 +53,13 @@ shell:
 # Volume Management
 # =============================================================================
 
-## volumes: List all volumes used by this project
+## volumes: List volumes and directories used by this project
 volumes:
-	@echo "Workspace volume:"
-	@podman volume inspect $(WORKSPACE_VOLUME) 2>/dev/null || echo "  (not created)"
+	@echo "Workspace directory: $(WORKSPACE_DIR)"
+	@ls -ld $(WORKSPACE_DIR) 2>/dev/null || echo "  (not created)"
 	@echo ""
 	@echo "Podman storage volume:"
 	@podman volume inspect $(PODMAN_STORAGE_VOLUME) 2>/dev/null || echo "  (not created)"
-
-## reset: Remove workspace volume (WARNING: destroys all agent work)
-reset:
-	@echo "WARNING: This will destroy all agent work in /workspace"
-	@read -p "Are you sure? [y/N] " confirm && [ "$$confirm" = "y" ] || exit 1
-	podman volume rm -f $(WORKSPACE_VOLUME)
-	@echo "Workspace volume removed. Will be recreated on next run."
-
-## reset-all: Remove all volumes and images (full reset)
-reset-all:
-	@echo "WARNING: This will destroy ALL data and the container image"
-	@read -p "Are you sure? [y/N] " confirm && [ "$$confirm" = "y" ] || exit 1
-	podman volume rm -f $(WORKSPACE_VOLUME) $(PODMAN_STORAGE_VOLUME) 2>/dev/null || true
-	podman rmi -f $(IMAGE_NAME):$(IMAGE_TAG) 2>/dev/null || true
-	@echo "Full reset complete."
 
 # =============================================================================
 # Cleanup
@@ -188,7 +173,7 @@ help:
 	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(run|Run|shell)' | grep -v 'test' | sed 's/## /  /' | sed 's/: /\t/'
 	@echo ""
 	@echo "Volume management:"
-	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(volume|reset|Volume)' | sed 's/## /  /' | sed 's/: /\t/'
+	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(volume|Volume)' | sed 's/## /  /' | sed 's/: /\t/'
 	@echo ""
 	@echo "Cleanup:"
 	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(clean|Clean)' | sed 's/## /  /' | sed 's/: /\t/'

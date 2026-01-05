@@ -219,9 +219,6 @@ podman build --jobs=0 -t agent-dev .
 
 # Run with source mounted
 ./run.sh -s ~/projects/myapp
-
-# Reset workspace (destroys agent work)
-./run.sh --reset
 ```
 
 ### Makefile Targets
@@ -233,7 +230,6 @@ podman build --jobs=0 -t agent-dev .
 | `make run` | Run the container |
 | `make run-build` | Build and run |
 | `make clean` | Remove build cache |
-| `make reset` | Remove workspace volume |
 | `make help` | Show all targets |
 
 ---
