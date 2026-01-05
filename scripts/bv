@@ -1,0 +1,6 @@
+#!/bin/bash
+# Beads Viewer wrapper - runs bv container with current directory mounted
+
+set -e
+
+exec podman run --rm -it -v "$(pwd):/project:ro" bv:latest "$@"

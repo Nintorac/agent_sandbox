@@ -68,6 +68,37 @@ alias agent='sudo -u yolo podman exec -it -u agent agent-dev zsh'
 - `yolo` - Run any command as the isolated yolo user
 - `agent` - Attach to a running container as the agent user
 
+### Standalone Beads Viewer (bv)
+
+Beads Viewer can run as a lightweight standalone container for viewing `.beads/beads.jsonl` files in any git repository.
+
+**Build the image:**
+
+```bash
+make build-bv
+```
+
+**Install the wrapper script:**
+
+```bash
+# Symlink to your PATH
+ln -s /path/to/agent_sandbox/scripts/bv ~/.local/bin/bv
+
+# Or copy it
+cp /path/to/agent_sandbox/scripts/bv ~/.local/bin/bv
+```
+
+**Usage:**
+
+```bash
+cd ~/projects/myapp
+bv              # View beads in repo
+bv --help       # Show help
+bv --export-md  # Export to markdown
+```
+
+The `scripts/bv` wrapper automatically mounts the git repository root if you're in a repo, otherwise it mounts the current directory.
+
 ## The Source/Workspace Workflow
 
 This container implements a **read-only source, writable workspace** pattern designed for multi-agent development:
