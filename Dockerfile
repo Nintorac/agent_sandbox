@@ -58,6 +58,15 @@ RUN cd /build/gastown \
             -X github.com/steveyegge/gastown/internal/cmd.Commit=${GT_COMMIT}" \
         -o /out/gt ./cmd/gt
 
+# --- Build beads (steveyegge/beads task tracker) ---
+COPY vendor/beads /build/beads
+RUN cd /build/beads \
+    && go mod download \
+    && CGO_ENABLED=0 GOOS=linux go build \
+        -trimpath \
+        -ldflags="-s -w" \
+        -o /out/bd ./cmd/bd
+
 # --- Build caam (no official Dockerfile, simple build) ---
 COPY vendor/coding_agent_account_manager /build/caam
 RUN cd /build/caam \
@@ -258,10 +267,11 @@ RUN mkdir -p /home/agent/.local/share/containers/storage \
 # Copy Pre-built Vendor Tools from Builder Stages
 # -----------------------------------------------------------------------------
 
-# Go tools (ntm, bv, gt, caam, slb)
+# Go tools (ntm, bv, gt, bd, caam, slb)
 COPY --from=go-builder --chown=agent:agent /out/ntm /home/agent/.local/bin/ntm
 COPY --from=go-builder --chown=agent:agent /out/bv /home/agent/.local/bin/bv
 COPY --from=go-builder --chown=agent:agent /out/gt /home/agent/.local/bin/gt
+COPY --from=go-builder --chown=agent:agent /out/bd /home/agent/.local/bin/bd
 COPY --from=go-builder --chown=agent:agent /out/caam /home/agent/.local/bin/caam
 COPY --from=go-builder --chown=agent:agent /out/slb /home/agent/.local/bin/slb
 

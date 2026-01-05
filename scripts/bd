@@ -1,0 +1,6 @@
+#!/bin/bash
+# Beads wrapper - runs bd container with current directory mounted
+
+set -e
+
+exec podman run --rm -it -v "$(pwd):/project" bd:latest "$@"

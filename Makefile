@@ -1,7 +1,7 @@
 # Agent Development Container Makefile
 # Build with parallel stages: make build
 
-.PHONY: build build-parallel build-nocache run run-build shell clean help test-smoke build-bv
+.PHONY: build build-parallel build-nocache run run-build shell clean help test-smoke build-bv build-bd
 
 # Configuration
 IMAGE_NAME ?= agent-dev
@@ -153,6 +153,11 @@ build-bv:
 	podman build -f vendor/beads_viewer/Dockerfile.standalone \
 		-t bv:latest vendor/beads_viewer
 
+## build-bd: Build standalone Beads image
+build-bd:
+	podman build -f vendor/beads/Dockerfile.standalone \
+		-t bd:latest vendor/beads
+
 # =============================================================================
 # Subtree Management
 # =============================================================================
@@ -191,7 +196,7 @@ help:
 	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(lint|inspect|history|size|subtree)' | sed 's/## /  /' | sed 's/: /\t/'
 	@echo ""
 	@echo "Standalone tool images:"
-	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(build-bv)' | sed 's/## /  /' | sed 's/: /\t/'
+	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(build-bv|build-bd)' | sed 's/## /  /' | sed 's/: /\t/'
 	@echo ""
 	@echo "Testing:"
 	@grep -E '^## ' $(MAKEFILE_LIST) | grep -E '(test)' | sed 's/## /  /' | sed 's/: /\t/'

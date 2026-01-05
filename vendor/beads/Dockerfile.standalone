@@ -1,0 +1,31 @@
+# Standalone Dockerfile for Beads (bd)
+# Build: podman build -f Dockerfile.standalone -t bd:latest .
+# Run:   podman run --rm -it -v "$(pwd):/project" bd:latest
+
+FROM golang:1.25-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /build
+
+# Copy source and build
+COPY . .
+RUN go mod download \
+    && CGO_ENABLED=0 GOOS=linux go build \
+        -trimpath \
+        -ldflags="-s -w" \
+        -o /bd ./cmd/bd
+
+# Runtime stage - minimal image
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates git
+
+# Create non-root user
+RUN adduser -D -u 1000 bd
+USER bd
+WORKDIR /project
+
+COPY --from=builder /bd /usr/local/bin/bd
+
+ENTRYPOINT ["bd"]

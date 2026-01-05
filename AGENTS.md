@@ -65,6 +65,7 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) format:
 | `cm` | CASS Memory System subtree |
 | `caam` | Coding Agent Account Manager subtree |
 | `slb` | Simultaneous Launch Button subtree |
+| `beads` | Beads subtree |
 
 ### Examples
 
@@ -99,6 +100,7 @@ git commit -m "build(vendor): update ntm to v1.4.0"
 | `vendor/coding_agent_account_manager` | Dicklesworthstone/coding_agent_account_manager | v0.1.0 |
 | `vendor/simultaneous_launch_button` | Dicklesworthstone/simultaneous_launch_button | v0.1.0 |
 | `vendor/gastown` | steveyegge/gastown | main |
+| `vendor/beads` | steveyegge/beads | v0.43.0 |
 
 ### Updating a Subtree
 
@@ -132,7 +134,7 @@ If upstream changed their build approach, update the corresponding builder stage
 
 | Builder Stage | Base Image | Tools |
 |---------------|-----------|-------|
-| `go-builder` | golang:1.25-alpine | ntm, bv, gt, caam, slb |
+| `go-builder` | golang:1.25-alpine | ntm, bv, gt, bd, caam, slb |
 | `rust-builder` | rust:slim + nightly | cass |
 | `node-builder` | oven/bun:latest | cm (cass_memory_system) |
 | `python-builder` | python:3.14-slim | mcp_agent_mail |
@@ -243,6 +245,7 @@ After build, these binaries are available in the container:
 | `ntm` | Named Tmux Manager | Spawn/manage agent sessions |
 | `gt` | Gastown | Multi-agent orchestration |
 | `bv` | Beads Viewer | Task management TUI |
+| `bd` | Beads | Task specification |
 | `cass` | Coding Agent Session Search | Search agent history |
 | `cm` | CASS Memory System | Procedural agent memory |
 | `caam` | Coding Agent Account Manager | Switch agent auth |
@@ -280,7 +283,7 @@ make build-progress     # Verbose output for debugging
 ```
 
 The Dockerfile uses 4 parallel builder stages:
-- **go-builder**: ntm, bv, gt, caam, slb
+- **go-builder**: ntm, bv, gt, bd, caam, slb
 - **rust-builder**: cass (requires nightly for edition 2024)
 - **node-builder**: cm (bun compile)
 - **python-builder**: mcp_agent_mail
