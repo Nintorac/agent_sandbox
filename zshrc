@@ -10,7 +10,11 @@ source $ZSH/oh-my-zsh.sh
 # Initialize tools
 eval "$(starship init zsh)"
 eval "$(zoxide init zsh)"
-eval "$(atuin init zsh)"
+eval "$(atuin init zsh --disable-up-arrow)"
+
+# Up/down arrow prefix search
+bindkey '^[[A' history-beginning-search-backward
+bindkey '^[[B' history-beginning-search-forward
 
 # Aliases using modern tools
 alias ls='lsd'
