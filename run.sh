@@ -161,6 +161,8 @@ if id "yolo" &>/dev/null; then
     # Run as isolated yolo user (recommended for security)
     echo -e "${GREEN}Running as isolated 'yolo' user${NC}"
     exec sudo -u yolo podman run \
+        --init \
+        --stop-signal SIGHUP \
         ${DETACH} \
         -it \
         --rm \
@@ -181,6 +183,8 @@ else
     echo -e "${YELLOW}Warning: 'yolo' user not found. Running as current user.${NC}"
     echo -e "${YELLOW}For better isolation, create yolo user (see docs/SECURITY.md)${NC}"
     exec podman run \
+        --init \
+        --stop-signal SIGHUP \
         ${DETACH} \
         -it \
         --rm \
