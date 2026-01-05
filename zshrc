@@ -1,6 +1,11 @@
 # Path configuration
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
 
+# Persistent history (mounted from host)
+export HISTFILE="$HOME/.zsh_history_dir/.zsh_history"
+export HISTSIZE=50000
+export SAVEHIST=50000
+
 # Oh-My-Zsh configuration
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME=""  # Using starship instead

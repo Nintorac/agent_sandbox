@@ -115,12 +115,39 @@ fi
 # Ensure workspace directory exists
 mkdir -p "$WORKSPACE_DIR"
 
+# Create agents_home subdirectories for persistent config
+# These need to be owned by the yolo user (if running as yolo) so the container can write
+AGENTS_HOME="${WORKSPACE_DIR}/agents_home"
+if id "yolo" &>/dev/null; then
+    sudo -u yolo mkdir -p "${AGENTS_HOME}/.claude"
+    sudo -u yolo mkdir -p "${AGENTS_HOME}/.codex"
+    sudo -u yolo mkdir -p "${AGENTS_HOME}/.gemini"
+    sudo -u yolo mkdir -p "${AGENTS_HOME}/.atuin"
+    sudo -u yolo mkdir -p "${AGENTS_HOME}/projects"
+    sudo -u yolo mkdir -p "${AGENTS_HOME}/.zsh_history_dir"
+else
+    mkdir -p "${AGENTS_HOME}/.claude"
+    mkdir -p "${AGENTS_HOME}/.codex"
+    mkdir -p "${AGENTS_HOME}/.gemini"
+    mkdir -p "${AGENTS_HOME}/.atuin"
+    mkdir -p "${AGENTS_HOME}/projects"
+    mkdir -p "${AGENTS_HOME}/.zsh_history_dir"
+fi
+
 # Build volume mount arguments
+# Note: label=disable is set on the container, so no :Z relabeling needed
 VOLUME_ARGS=(
     # Rootless podman storage (avoid overlay-on-overlay)
     "-v" "agent-home:/home/agent/.local/share/containers"
     # Persistent workspace (bind mount from host)
-    "-v" "${WORKSPACE_DIR}:/workspace:Z"
+    "-v" "${WORKSPACE_DIR}:/workspace"
+    # Agent CLI configs (persist auth, settings, history)
+    "-v" "${AGENTS_HOME}/.claude:/home/agent/.claude"
+    "-v" "${AGENTS_HOME}/.codex:/home/agent/.codex"
+    "-v" "${AGENTS_HOME}/.gemini:/home/agent/.gemini"
+    # Shell history (atuin database)
+    "-v" "${AGENTS_HOME}/.atuin:/home/agent/.local/share/atuin"
+    "-v" "${AGENTS_HOME}/.zsh_history_dir:/home/agent/.zsh_history_dir"
 )
 
 # Add source mounts

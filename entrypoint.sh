@@ -134,11 +134,39 @@ EOF
 }
 
 # =============================================================================
+# Fix Mounted Directory Permissions
+# =============================================================================
+
+fix_mount_permissions() {
+    # Fix ownership of mounted config directories so agent user can write
+    # These are bind-mounted from host and may have wrong ownership
+    local dirs=(
+        "/home/agent/.claude"
+        "/home/agent/.codex"
+        "/home/agent/.gemini"
+        "/home/agent/.local/share/atuin"
+        "/home/agent/.zsh_history_dir"
+        "/workspace/agents_home"
+    )
+
+    for dir in "${dirs[@]}"; do
+        if [ -d "$dir" ]; then
+            chown -R agent:agent "$dir" 2>/dev/null || true
+        fi
+    done
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 
 main() {
     print_banner
+
+    # Fix permissions first (while still root)
+    if [ "$(id -u)" = "0" ]; then
+        fix_mount_permissions
+    fi
 
     setup_git
     init_gastown

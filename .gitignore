@@ -34,3 +34,5 @@ Thumbs.db
 # Container builds
 *.tar
 *.tar.gz
+
+CLAUDE.md

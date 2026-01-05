@@ -390,6 +390,9 @@ VOLUME /workspace
 COPY --chown=agent:agent entrypoint.sh /home/agent/entrypoint.sh
 RUN chmod +x /home/agent/entrypoint.sh
 
+# NTM projects base - use workspace subdirectory instead of /data/projects
+ENV NTM_PROJECTS_BASE=/workspace/agents_home/projects
+
 USER agent
 WORKDIR /workspace
 
